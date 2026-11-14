@@ -1,0 +1,7 @@
+Implement unique_names(names) in names.py for an iterable of strings.
+Trim surrounding whitespace and discard blank names. Keep only the first
+occurrence, in input order, and preserve that occurrence's trimmed spelling.
+Treat Unicode case variants (Straße / STRASSE) and canonically equivalent
+spellings (café with composed or decomposed accents) as equivalent. Retain the
+distinction between purely compatibility-equivalent spellings such as Ａ and A.
+Use the Python standard library. Acceptance: from examples, run python -B verify.py.
