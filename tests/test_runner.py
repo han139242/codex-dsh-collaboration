@@ -45,10 +45,13 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(self.run_main("--context", str(self.context), "--advice", "Compare."), 0)
             self.context.unlink()  # Round 1 must use the saved copy.
             self.assertEqual(self.run_main(*self.review_args), 2)
+            first_brief = self.record / "review-1.brief.txt"
+            original_brief = first_brief.read_bytes()
+            self.context.write_text("Fact: one-shot iterable. Added proof: test X.", encoding="utf-8")
             self.source.write_text("REVISED", encoding="utf-8")
             decisions = self.source.with_name("decisions.txt")
             decisions.write_text("Fixed; confirmed by example X.", encoding="utf-8")
-            self.assertEqual(self.run_main(*self.review_args, "--round", "2",
+            self.assertEqual(self.run_main(*self.review_args, "--round", "2", "--context", str(self.context),
                                            "--decisions", str(decisions)), 0)
         for invocation in call.call_args_list:
             prompt = invocation.args[-1]
@@ -58,6 +61,9 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("REVISED", final_prompt)
         self.assertIn("first spelling lost", final_prompt)
         self.assertIn("confirmed by example X", final_prompt)
+        self.assertIn("Added proof: test X", final_prompt)
+        self.assertEqual(first_brief.read_bytes(), original_brief)
+        self.assertNotIn(b"Added proof", original_brief)
         snapshot = (self.record / "review-2.source.txt").read_bytes()
         report = json.loads((self.record / "review-2.json").read_text(encoding="utf-8"))
         self.assertEqual(report["snapshot_sha256"], hashlib.sha256(snapshot).hexdigest())
@@ -69,6 +75,52 @@ class RunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Shared goal changed"):
                 self.run_main(*self.review_args)
             call.assert_called_once()
+
+    def test_windows_utf8_bom_does_not_change_shared_goal(self):
+        with patch.object(run_dsh, "ask_dsh", side_effect=[
+            ("A plan", "session-advice"), self.review_reply(),
+        ]) as call:
+            self.assertEqual(self.run_main("--advice", "Compare."), 0)
+            goal = self.goal.read_text(encoding="utf-8")
+            self.goal.write_text(goal, encoding="utf-8-sig")
+            self.assertEqual(self.run_main(*self.review_args), 0)
+            self.assertNotIn("\ufeff", call.call_args.args[-1])
+
+    def test_rejected_round_keeps_previous_context(self):
+        with patch.object(run_dsh, "ask_dsh", return_value=self.review_reply()) as call:
+            self.assertEqual(self.run_main(*self.review_args, "--context", str(self.context)), 0)
+            prior = (self.record / "shared-context.txt").read_bytes()
+            self.context.write_text("Context from an accidental duplicate.", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "already has a result"):
+                self.run_main(*self.review_args, "--context", str(self.context))
+            self.assertEqual((self.record / "shared-context.txt").read_bytes(), prior)
+            call.assert_called_once()
+
+    def test_second_round_cannot_switch_workspaces(self):
+        other = self.source.parent / "other"
+        other.mkdir()
+        (other / self.source.name).write_text("UNRELATED", encoding="utf-8")
+        with patch.object(run_dsh, "ask_dsh", return_value=self.review_reply()) as call:
+            self.assertEqual(self.run_main(*self.review_args), 0)
+            with self.assertRaisesRegex(RuntimeError, "Review workspace changed"):
+                self.run_main("--workspace", str(other), "--source", self.source.name,
+                              "--round", "2")
+            call.assert_called_once()
+
+    def test_only_completed_review_gets_a_canonical_source_snapshot(self):
+        with patch.object(run_dsh, "ask_dsh", side_effect=[
+            RuntimeError("DSH timed out"), self.review_reply(),
+        ]):
+            with self.assertRaisesRegex(RuntimeError, "DSH timed out"):
+                self.run_main(*self.review_args)
+            saved = self.record / "review-1.source.txt"
+            self.assertFalse(saved.exists())
+            self.assertTrue((self.record / "review-workspace.txt").is_file())
+            with self.assertRaisesRegex(RuntimeError, "Round 1 has no completed review"):
+                self.run_main(*self.review_args, "--round", "2")
+            self.source.write_text("NEW ATTEMPT", encoding="utf-8")
+            self.assertEqual(self.run_main(*self.review_args), 0)
+            self.assertIn(b"NEW ATTEMPT", saved.read_bytes())
 
     def test_questions_prevent_automatic_acceptance(self):
         with patch.object(run_dsh, "ask_dsh", return_value=self.review_reply(
@@ -83,6 +135,32 @@ class RunnerTest(unittest.TestCase):
         with patch.object(run_dsh, "ask_dsh", return_value=self.review_reply()), \
                 patch.object(run_dsh, "run_stage", side_effect=mutate):
             self.assertEqual(self.run_main(*self.review_args, "--check", "python", "-B"), 2)
+
+    def test_unreadable_post_check_snapshot_is_reported_as_changed(self):
+        for kind in ("missing", "invalid UTF-8"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source.py"
+                source.write_text("ORIGINAL", encoding="utf-8")
+                record = root / "record"
+                argv = ["runner", "--goal", str(self.goal), "--run-dir", str(record),
+                        "--workspace", str(root), "--source", source.name,
+                        "--check", "python", "-B"]
+
+                def acceptance(*args, **kwargs):
+                    if kind == "missing":
+                        source.rename(root / "renamed.py")
+                    else:
+                        source.write_bytes(b"\xff")
+                    return 0, ""
+
+                output = io.StringIO()
+                with patch.object(sys, "argv", argv), patch.object(run_dsh, "check_plugin"), \
+                        patch.object(run_dsh, "ask_dsh", return_value=self.review_reply()), \
+                        patch.object(run_dsh, "run_stage", side_effect=acceptance), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(run_dsh.main(), 2)
+                self.assertIn("SNAPSHOT_CHANGED", output.getvalue())
 
 
 if __name__ == "__main__":

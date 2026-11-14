@@ -20,7 +20,9 @@ DSH 提供意见，**Codex 对方案、改动和验收结论负责**。把 DSH �
 
 ## 调用
 
-脚本是本 Skill 目录下的 `scripts/run_dsh.py`，需要 Windows 和 Python 3.10 或以上。给任务创建一个项目外的运行目录。`$runner`、`$record` 和 `$project` 都用绝对路径。UTF-8 的 `--context` 同时用于讨论和审查，省略时沿用该运行目录上一次提交的背景。复查可用 `--decisions` 带入 Codex 对上一轮重要意见的处理记录。继续讨论可用 `--advice-label` 为下一个问题命名。
+脚本是本 Skill 目录下的 `scripts/run_dsh.py`，需要 Windows 和 Python 3.10 或以上。给任务创建一个项目外的运行目录，DSH headless 会以该目录启动，不用在桌面界面登记工作区。复查沿用第一轮的项目目录。`$runner`、`$record` 和 `$project` 都用绝对路径。UTF-8 的 `--context` 同时用于讨论和审查，省略时沿用该运行目录上一次提交的背景。复查可用 `--decisions` 带入 Codex 对上一轮重要意见的处理记录。继续讨论可用 `--advice-label` 为下一个问题命名。
+
+需要改用桌面交互时，先在 DSH 里添加只包含本任务材料的独立文件夹，再在该工作区新建会话。发送前核对国内 WorkBuddy 和 DeepSeek V4.1 Flash；使用同一份任务说明，并明确把桌面回复作为单独审查记录。
 
 ```powershell
 python -B $runner --run-dir $record --goal "$record/goal.txt" --context "$record/context.txt" --advice '比较两个方案及最小验证'
