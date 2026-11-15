@@ -17,6 +17,13 @@ shared-goal.txt
 shared-context.txt
 shared-benchmark.md
 review-workspace.txt
+dsh-workspace.txt
+workspace-attach.json
+bridge-*.json
+bridge-*.md
+dsh-conversation.json
+dsh-conversation.json.tmp
+.dsh-run.lock
 review-*.brief.txt
 review-*.source.txt
 review-*.json

@@ -15,6 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_dsh
 
 
+SESSION = "session-00000000-0000-0000-0000-000000000001"
+OTHER_SESSION = "session-00000000-0000-0000-0000-000000000002"
+
+
+def model_started(session_id=SESSION):
+    return json.dumps({"type": "session", "sessionId": session_id}).encode("utf-8") + b"\n"
+
+
 class RunnerTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -69,13 +77,35 @@ class RunnerTest(unittest.TestCase):
         status = (self.record / "slow.status.md").read_text(encoding="utf-8")
         self.assertIn("进程超时已结束", status)
 
+    def test_completed_reply_does_not_wait_for_a_lingering_process(self):
+        self.record.mkdir()
+        final = json.dumps({"type": "final", "reason": {"kind": "completed"},
+                            "text": "完整答复", "sessionId": "session-example"})
+        script = f"import time; print({final!r}, flush=True); time.sleep(10)"
+        with patch.object(run_dsh, "PROGRESS_INTERVAL", .2), contextlib.redirect_stdout(io.StringIO()):
+            code, output = run_dsh.run_stage("review", [sys.executable, "-c", script],
+                                             workspace=self.record, out=self.record, timeout=4,
+                                             accept_completed_reply=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(run_dsh.completed_response(run_dsh.read_cli_events(output)),
+                         ("完整答复", "session-example"))
+        status = (self.record / "review.status.md").read_text(encoding="utf-8")
+        self.assertIn("已收到完整模型回复", status)
+
+    def test_desktop_write_handle_conflict_stops_route_retry(self):
+        self.record.mkdir()
+        script = "import sys; print('session is already owned by an active write handle', file=sys.stderr); sys.exit(1)"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "已停止重试"):
+            run_dsh.run_stage("review", [sys.executable, "-c", script], workspace=self.record,
+                              out=self.record, timeout=5, accept_completed_reply=True)
+
     @staticmethod
     def review_reply(verdict="PASS", findings=None, questions=None):
         status = "需修订" if verdict == "FAIL" else "待确认" if questions else "通过"
         issues = "\n".join(f"- {item}" for item in findings or []) or "无"
         doubts = "\n".join(f"- {item}" for item in questions or []) or "无"
         return (f"## 结论\n{status}\n\n## 核查依据\n核对了首次输入拼写的保留规则。"
-                f"\n\n## 发现的问题\n{issues}\n\n## 待确认\n{doubts}\n"), "session-example"
+                f"\n\n## 发现的问题\n{issues}\n\n## 待确认\n{doubts}\n"), SESSION
 
     def test_shared_context_and_review_followup(self):
         with patch.object(run_dsh, "ask_dsh", side_effect=[
@@ -185,12 +215,11 @@ class RunnerTest(unittest.TestCase):
     def test_pending_desktop_request_cannot_replace_or_withdraw_benchmark(self):
         benchmark = self.source.with_name("benchmark.md")
         benchmark.write_text("旧对标", encoding="utf-8")
-        timeout = subprocess.TimeoutExpired("fake-dsh", 1)
-        with patch.object(run_dsh, "DESKTOP_WORKSPACE", self.record.parent / "shared-desktop"), \
-                patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
+        timeout = subprocess.TimeoutExpired("fake-dsh", 1, output=model_started())
+        with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
                 patch.object(run_dsh, "run_stage", side_effect=timeout) as stage:
             with self.assertRaises(run_dsh.DesktopFallbackRequired):
-                self.run_main(*self.review_args, "--benchmark", str(benchmark))
+                self.run_main(*self.review_args, "--route", "cn-flash", "--benchmark", str(benchmark))
             benchmark.write_text("更新后的对标", encoding="utf-8")
             for flags in [("--benchmark", str(benchmark)), ("--clear-benchmark",)]:
                 with self.subTest(flags=flags), self.assertRaisesRegex(RuntimeError, "Task or snapshot changed"):
@@ -260,19 +289,19 @@ class RunnerTest(unittest.TestCase):
 
     def test_model_timeout_handoff_import_requires_unchanged_request(self):
         headless_id = "session-00000000-0000-0000-0000-000000000001"
-        desktop_id = "session-00000000-0000-0000-0000-000000000002"
+        desktop_id = headless_id
         event = json.dumps({"type": "session", "sessionId": headless_id}).encode("utf-8")
         timeout = subprocess.TimeoutExpired("fake-dsh", 1, output=event)
         with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
-                patch.object(run_dsh, "run_stage", side_effect=timeout) as stage, \
-                patch.object(run_dsh, "DESKTOP_WORKSPACE", self.record.parent / "shared-desktop"):
+                patch.object(run_dsh, "run_stage", side_effect=timeout) as stage:
             with self.assertRaisesRegex(run_dsh.DesktopFallbackRequired, "DSH_DESKTOP_REQUIRED"):
-                self.run_main(*self.review_args, "--timeout", "1")
+                self.run_main(*self.review_args, "--route", "cn-flash", "--timeout", "1")
         self.assertEqual(stage.call_args.kwargs["timeout"], 1)
         handoff = json.loads((self.record / "review-1.desktop.json").read_text(encoding="utf-8"))
         request = Path(handoff["request"])
-        self.assertEqual(Path(handoff["workspace"]), self.record.parent / "shared-desktop")
-        self.assertEqual(list(Path(handoff["workspace"]).iterdir()), [])
+        self.assertEqual(Path(handoff["workspace"]), self.record)
+        self.assertFalse((self.record.parent / "shared-desktop").exists())
+        self.assertEqual(handoff["session_id"], headless_id)
         self.assertEqual(request.parent, self.record)
         self.assertIn(handoff["request_id"], request.read_text(encoding="utf-8"))
         self.assertIn("INITIAL", request.read_text(encoding="utf-8"))
@@ -286,6 +315,8 @@ class RunnerTest(unittest.TestCase):
                 patch.object(run_dsh, "verified_session_reply", return_value=reply) as extract:
             with self.assertRaisesRegex(run_dsh.DesktopFallbackRequired, "already prepared"):
                 self.run_main(*self.review_args)
+            with self.assertRaisesRegex(RuntimeError, "已绑定的 DSH 会话"):
+                self.run_main(*self.review_args, "--desktop-session-id", OTHER_SESSION)
             self.source.write_text("UPDATED", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "Task or snapshot changed"):
                 self.run_main(*self.review_args, *flags)
@@ -308,21 +339,21 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(report["session_id"], desktop_id)
         self.assertEqual(report["questions"], ["请核对输入。"])
 
-    def test_identical_tasks_share_a_desktop_workspace_but_not_a_request_id(self):
+    def test_identical_tasks_keep_distinct_conversations_and_request_ids(self):
         other = self.record.parent / "other"
-        shared = self.record.parent / "shared-desktop"
         self.record.mkdir()
         other.mkdir()
-        timeout = subprocess.TimeoutExpired("fake-dsh", 1)
-        with patch.object(run_dsh, "DESKTOP_WORKSPACE", shared), \
-                patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
-                patch.object(run_dsh, "run_stage", side_effect=timeout):
+        timeouts = [subprocess.TimeoutExpired("fake-dsh", 1, output=model_started(session))
+                    for session in (SESSION, OTHER_SESSION)]
+        with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
+                patch.object(run_dsh, "run_stage", side_effect=timeouts):
             for folder in [self.record, other]:
                 with self.assertRaises(run_dsh.DesktopFallbackRequired):
                     run_dsh.ask_dsh(folder, None, "review-1", "同一个问题")
         first, second = [json.loads((folder / "review-1.desktop.json").read_text(encoding="utf-8"))
                          for folder in [self.record, other]]
-        self.assertEqual(first["workspace"], second["workspace"])
+        self.assertNotEqual(first["workspace"], second["workspace"])
+        self.assertNotEqual(first["session_id"], second["session_id"])
         self.assertNotEqual(first["prompt_sha256"], second["prompt_sha256"])
 
     def test_workbuddy_routes_select_only_the_requested_model_and_region(self):
@@ -340,18 +371,172 @@ class RunnerTest(unittest.TestCase):
                     self.assertIn({"id": "llm-deepseek", "disabled": True}, disabled)
                     self.assertIn({"id": "llm-deepseek-account", "disabled": True}, disabled)
 
-    def test_global_retry_keeps_unusable_domestic_reply_and_labels_final_review(self):
+    def test_scoped_review_requires_tool_evidence_and_saves_real_route(self):
+        answer, session_id = self.review_reply()
+        final = {"type": "final", "reason": {"kind": "completed"},
+                 "text": answer, "sessionId": session_id}
+        call = {"type": "tool_call", "tool": "codex_inspect", "callId": "scope-1",
+                "input": {"action": "read_text"}}
+        result = {"type": "tool_result", "callId": "scope-1", "status": "completed"}
+        completed = "\n".join(map(json.dumps, (call, result, final)))
+        flags = (*self.review_args, "--inspect-file", str(self.source), "--route", "cn-flash")
+        with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
+                patch.object(run_dsh, "run_stage", side_effect=[(0, json.dumps(final)), (0, completed)]) as stage:
+            with self.assertRaisesRegex(run_dsh.DSHResponseError, "没有完成限定范围"):
+                self.run_main(*flags)
+            self.assertFalse((self.record / "review-1.json").exists())
+            self.assertEqual(self.run_main(*flags), 0)
+        self.assertIn("先用 codex_inspect 实际取证", stage.call_args.kwargs["prompt"])
+        overlay = json.loads((self.record / "workbuddy-cn-flash.json").read_text(encoding="utf-8"))
+        self.assertEqual(overlay[-1]["insert"][0]["config"]["roots"],
+                         [{"path": str(self.source), "text": True}])
+        report = json.loads((self.record / "review-1.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["inspection"], "scoped-tools")
+
+    def test_auto_retry_keeps_unusable_domestic_reply_and_labels_final_review(self):
         with patch.object(run_dsh, "ask_dsh", side_effect=[
             ("这条回复没有审查内容。", "session-cn"), self.review_reply(),
         ]) as model:
-            with self.assertRaisesRegex(RuntimeError, "DSH 原文已保存"):
-                self.run_main(*self.review_args)
-            self.assertEqual(self.run_main(*self.review_args, "--route", "global-flash"), 0)
+            self.assertEqual(self.run_main(*self.review_args), 0)
         self.assertEqual(model.call_args_list[0].args[-1], model.call_args_list[1].args[-1])
         self.assertIn("没有审查内容", (self.record / "review-1.rejected.md").read_text(encoding="utf-8"))
         report = json.loads((self.record / "review-1.json").read_text(encoding="utf-8"))
         self.assertEqual((report["provider"], report["model"], report["route"]),
                          ("workbuddy-global", run_dsh.MODEL, "global-flash"))
+
+    def test_auto_cli_timeout_falls_back_in_order_before_returning_a_real_finding(self):
+        timeout_output = model_started() + b'{"type":"status","phase":"step_start"}\n'
+        timeout = subprocess.TimeoutExpired("fake-dsh", 1, output=timeout_output)
+        answer, session_id = self.review_reply("FAIL", findings=["发现一条真实缺陷。"])
+        final = json.dumps({"type": "final", "reason": {"kind": "completed"},
+                            "text": answer, "sessionId": session_id})
+        with patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh, "run_stage", side_effect=[timeout, timeout, (0, final)]) as call:
+            self.assertEqual(self.run_main(*self.review_args, "--timeout", "1"), 2)
+        labels = [stage.args[0] for stage in call.call_args_list]
+        self.assertEqual(labels, ["review-1", "review-1.global-flash", "review-1.cn-hy4"])
+        commands = [stage.args[1] for stage in call.call_args_list]
+        self.assertNotIn("--session-id", commands[0])
+        for command in commands[1:]:
+            self.assertEqual(command[command.index("--session-id") + 1], SESSION)
+        report = json.loads((self.record / "review-1.json").read_text(encoding="utf-8"))
+        self.assertEqual((report["route"], report["transport"], report["verdict"]),
+                         ("cn-hy4", "headless", "FAIL"))
+        handoff = json.loads((self.record / "review-1.desktop.json").read_text(encoding="utf-8"))
+        self.assertEqual(handoff["last_cli_phase"], "step_start")
+        self.assertEqual(handoff["timeout_seconds"], 1)
+
+    def test_auto_waits_for_all_cli_routes_before_requesting_desktop(self):
+        timeout = subprocess.TimeoutExpired("fake-dsh", 1, output=model_started())
+        with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
+                patch.object(run_dsh, "run_stage", side_effect=timeout) as call:
+            with self.assertRaisesRegex(run_dsh.DesktopFallbackRequired, r"review-1\.desktop\.json"):
+                self.run_main(*self.review_args, "--timeout", "1")
+            self.assertEqual(call.call_count, 4)
+            with self.assertRaisesRegex(run_dsh.DesktopFallbackRequired, "already prepared"):
+                self.run_main(*self.review_args, "--timeout", "1")
+            self.assertEqual(call.call_count, 4)
+
+    def test_unknown_startup_identity_does_not_launch_another_conversation(self):
+        with patch.object(run_dsh, "dsh_command", return_value=["fake-dsh"]), \
+                patch.object(run_dsh, "run_stage", side_effect=subprocess.TimeoutExpired("fake-dsh", 1)) as call:
+            with self.assertRaisesRegex(RuntimeError, "未取得 DSH 会话 ID"):
+                self.run_main(*self.review_args, "--timeout", "1")
+            with self.assertRaisesRegex(RuntimeError, "未能确定唯一"):
+                self.run_main(*self.review_args, "--timeout", "1")
+            call.assert_called_once()
+
+    def test_advice_and_review_share_a_session_and_reuse_the_working_route(self):
+        reply, session_id = self.review_reply()
+        completed = lambda text: json.dumps({"type": "final", "sessionId": session_id,
+                                              "text": text, "reason": {"kind": "completed"}})
+        error = json.dumps({"type": "final", "sessionId": session_id,
+                            "reason": {"kind": "error", "error": {"code": "MODEL_BUSY"}}})
+        with patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh, "run_stage", side_effect=[
+                    (1, error), (0, completed("独立建议")), (0, completed(reply)),
+                ]) as call:
+            self.assertEqual(self.run_main("--advice", "提出测试"), 0)
+            self.assertEqual(self.run_main(*self.review_args), 0)
+        self.assertEqual([row.args[0] for row in call.call_args_list],
+                         ["advice", "advice.global-flash", "review-1.global-flash"])
+        for invocation in call.call_args_list[1:]:
+            command = invocation.args[1]
+            self.assertEqual(command[command.index("--session-id") + 1], session_id)
+
+    def test_model_reported_unknown_is_skipped_on_future_automatic_calls(self):
+        def error(code):
+            return 1, json.dumps({"type": "final", "sessionId": SESSION,
+                                  "reason": {"kind": "error", "error": {"code": code}}})
+
+        reply, session_id = self.review_reply()
+        success = (0, json.dumps({"type": "final", "sessionId": session_id,
+                                  "text": reply, "reason": {"kind": "completed"}}))
+        with patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh, "run_stage", side_effect=[
+                    error("UNKNOWN_MODEL"), error("MODEL_BUSY"), error("MODEL_BUSY"), success,
+                ]) as call:
+            with self.assertRaisesRegex(run_dsh.DSHResponseError, "UNKNOWN_MODEL"):
+                self.run_main("--advice", "独立思考", "--route", "cn-hy4")
+            self.assertEqual(self.run_main(*self.review_args), 0)
+        self.assertEqual([row.args[0] for row in call.call_args_list],
+                         ["advice.cn-hy4", "review-1", "review-1.global-flash", "review-1.global-hy4"])
+
+    def test_rejecting_a_concurrent_turn_releases_the_task_for_followup(self):
+        with run_dsh.task_lock(self.record):
+            with self.assertRaisesRegex(RuntimeError, "会话正在使用"):
+                self.run_main("--advice", "同时发送")
+        with run_dsh.task_lock(self.record):
+            self.assertTrue(self.record.is_dir())
+
+    def test_existing_dsh_workspace_keeps_one_conversation_and_separate_logs(self):
+        group = self.record.parent / "DSH group"
+        group.mkdir()
+        output = "\n".join((json.dumps({"type": "session", "sessionId": SESSION, "cwd": str(group)}),
+                             json.dumps({"type": "final", "sessionId": SESSION,
+                                         "text": "独立建议", "reason": {"kind": "completed"}})))
+        with patch.object(run_dsh, "attach_dsh_workspace") as attach, \
+                patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh, "run_stage", return_value=(0, output)) as call:
+            self.assertEqual(self.run_main("--advice", "第一个问题", "--dsh-workspace", str(group)), 0)
+            self.assertEqual(self.run_main("--advice", "接着讨论", "--advice-label", "next"), 0)
+            with self.assertRaisesRegex(RuntimeError, "DSH 工作区与"):
+                self.run_main("--advice", "更换目录", "--advice-label", "other",
+                              "--dsh-workspace", str(self.source.parent))
+        for turn in call.call_args_list:
+            self.assertEqual(turn.kwargs["workspace"], group)
+            self.assertEqual(turn.kwargs["out"], self.record)
+        self.assertNotIn("--session-id", call.call_args_list[0].args[1])
+        self.assertIn(SESSION, call.call_args_list[1].args[1])
+        self.assertEqual(attach.call_count, 2)
+        attach.assert_called_with(self.record, group, SESSION)
+
+    def test_workspace_membership_is_registered_without_creating_a_model_turn(self):
+        group = self.record.parent / "DSH group"
+        group.mkdir()
+        self.record.mkdir()
+        storages = self.record.parent / "storages"
+        storages.mkdir()
+        path = storages / "workspace.json"
+        records = {"tables": {"workspaces": {"demo": {"path": str(group), "sessionIds": []}}}}
+        path.write_text(json.dumps(records), encoding="utf-8")
+
+        def simulated_registry(command, **options):
+            self.assertIs(options["stdin"], subprocess.DEVNULL)
+            self.assertEqual(options["cwd"], group)
+            patch_file = Path(command[command.index("--patch") + 1])
+            config = json.loads(patch_file.read_text(encoding="utf-8"))[-1]["insert"][-1]["config"]
+            self.assertEqual(config, {"workspace": str(group), "sessionId": SESSION})
+            records["tables"]["workspaces"]["demo"]["sessionIds"] = [SESSION]
+            path.write_text(json.dumps(records), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="attached", stderr="")
+
+        with patch.object(run_dsh, "DSH_ROOT", self.record.parent), \
+                patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh.subprocess, "run", side_effect=simulated_registry) as attach:
+            run_dsh.attach_dsh_workspace(self.record, group, SESSION)
+            run_dsh.attach_dsh_workspace(self.record, group, SESSION)
+        attach.assert_called_once()
 
     def test_desktop_reply_requires_matching_workspace_prompt_and_model(self):
         session_id = "session-00000000-0000-0000-0000-000000000002"
@@ -377,6 +562,18 @@ class RunnerTest(unittest.TestCase):
             ("turn/end", end),
         ])]
         with patch.object(run_dsh, "read_session_events", return_value=trace):
+            self.assertEqual(run_dsh.verified_session_reply(self.record, prompt, session_id), reply)
+            prior = [
+                {"type": "turn/start", "data": {"turn": 0}},
+                {"type": "user/message", "data": {"source": {"kind": "user"}, "content": [
+                    {"type": "text", "text": "上一个问题"},
+                ]}},
+                {"type": "request/header", "data": {"header": {"config": {
+                    "provider": "workbuddy-global", "model": run_dsh.MODEL,
+                }}}},
+                {"type": "turn/end", "data": {"turn": 0, "reason": {"kind": "interrupted"}}},
+            ]
+            trace[1:1] = prior
             self.assertEqual(run_dsh.verified_session_reply(self.record, prompt, session_id), reply)
             global_provider, hy4 = run_dsh.ROUTES["global-hy4"]
             international = {"provider": global_provider, "model": hy4}

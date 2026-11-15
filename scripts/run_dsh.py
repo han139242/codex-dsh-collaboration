@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 from hashlib import sha256
 import json
@@ -28,9 +29,9 @@ MAX_REVIEWS = 2
 DESKTOP_FALLBACK_EXIT = 3
 PROGRESS_INTERVAL = 15
 STOP_TIMEOUT = 5
+CONVERSATION_RECORD = "dsh-conversation.json"
 DSH_ROOT = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
 COLLAB_ROOT = Path(os.environ.get("DSH_COLLAB_DIR") or Path.home() / "Documents/Codex/dsh-collaboration")
-DESKTOP_WORKSPACE = (COLLAB_ROOT / "Codex + DSH 协作").resolve()
 DESKTOP_ROOT = Path(os.environ.get("DSH_DESKTOP_DIR") or (
     Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
     / "Programs/DeepSeek Harness"
@@ -40,6 +41,101 @@ DESKTOP_CLI = DESKTOP_ROOT / "resources/app.asar/dsh/node_modules/@deepseek-ai/d
 PLUGIN = Path(os.environ.get("DSH_WORKBUDDY_ENTRY") or (
     DSH_ROOT / "profiles/desktop/node_modules/dsh-connect-workbuddy/lib/index.js"
 )).resolve()
+
+
+@contextmanager
+def task_lock(out):
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".dsh-run.lock").open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+
+            def acquire():
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            def acquire():
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            acquire()
+        except OSError as error:
+            raise RuntimeError("该任务的 DSH 会话正在使用，请等当前轮回复后继续。") from error
+        yield
+
+
+def conversation(out):
+    path = out / CONVERSATION_RECORD
+    if not path.is_file():
+        return {}
+    state = json.loads(path.read_text(encoding="utf-8"))
+    session_id = state.get("session_id")
+    if session_id is not None and (not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id)):
+        raise RuntimeError("协作记录里的 DSH 会话 ID 无效。")
+    return state
+
+
+def save_conversation(out, session_id, route=None, *, unavailable=None):
+    state = conversation(out)
+    if state.get("session_id") and state["session_id"] != session_id:
+        raise RuntimeError("DSH 返回的会话与本任务绑定的会话不一致。")
+    state["session_id"] = session_id
+    if route is not None:
+        state["usable_route"] = route
+        if route in state.get("unavailable_routes", ()):
+            state["unavailable_routes"].remove(route)
+    if unavailable is not None:
+        unavailable_routes = state.setdefault("unavailable_routes", [])
+        if unavailable not in unavailable_routes:
+            unavailable_routes.append(unavailable)
+    pending = out / (CONVERSATION_RECORD + ".tmp")
+    pending.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    pending.replace(out / CONVERSATION_RECORD)
+
+
+def cli_session(events, workspace):
+    ids = set()
+    for row in events:
+        if row.get("type") not in ("session", "final"):
+            continue
+        session_id = row.get("sessionId")
+        if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
+            continue
+        if row.get("cwd") and Path(row["cwd"]).resolve() != workspace:
+            raise RuntimeError("DSH 返回的会话工作区与本任务不一致。")
+        ids.add(session_id)
+    if len(ids) > 1:
+        raise RuntimeError("同一次命令行调用返回了多个 DSH 会话。")
+    return next(iter(ids), None)
+
+
+def task_session(out, workspace):
+    out = out.resolve()
+    state = conversation(out)
+    if state.get("session_id"):
+        return state["session_id"]
+    # Bind an existing headless result when upgrading a task from the old runner.
+    if not state:
+        reports = sorted((*out.glob("review-*.json"), *out.glob("advice*.json")),
+                         key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        for path in reports:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            session_id = report.get("session_id")
+            if report.get("transport") == "headless" and isinstance(session_id, str) and SESSION_ID.fullmatch(session_id):
+                save_conversation(out, session_id, report.get("route"))
+                return session_id
+    attempts = [path for path in out.glob("*.stdout.log")
+                if path.name.startswith(("advice", "review-"))]
+    known = {session_id for path in attempts
+             if (session_id := cli_session(read_cli_events(path.read_text(encoding="utf-8", errors="replace")), workspace))}
+    if len(known) == 1:
+        session_id = known.pop()
+        save_conversation(out, session_id)
+        return session_id
+    if state or attempts:
+        raise RuntimeError("未能确定唯一的原 DSH 会话，已停止发送以避免再开一条。请核对本轮命令行日志。")
+    return None
 
 
 def stop_stage(process, diagnostics):
@@ -85,7 +181,8 @@ def stage_status(out, label, text, has_prompt):
         print(f"[{label}] 进度文件写入失败：{error}", file=sys.stderr, flush=True)
 
 
-def run_stage(label, command, *, workspace, out, prompt=None, timeout=240, env=None):
+def run_stage(label, command, *, workspace, out, prompt=None, timeout=240, env=None,
+              accept_completed_reply=False):
     stdout = out / f"{label}.stdout.log"
     stderr = out / f"{label}.stderr.log"
     # Preserve the inputs and diagnostics of each failed attempt as well.
@@ -118,6 +215,14 @@ def run_stage(label, command, *, workspace, out, prompt=None, timeout=240, env=N
                     code = process.wait(timeout=max(0, min(PROGRESS_INTERVAL, remaining)))
                     break
                 except subprocess.TimeoutExpired:
+                    if accept_completed_reply:
+                        output = stdout.read_text(encoding="utf-8", errors="replace")
+                        if completed_response(read_cli_events(output)) is not None:
+                            stop_stage(process, diagnostics)
+                            status = "已收到完整模型回复，命令行进程已收尾。"
+                            stage_status(out, label, status, prompt is not None)
+                            print(f"[{label}] {status}", flush=True)
+                            return 0, output
                     if time.monotonic() >= deadline:
                         raise subprocess.TimeoutExpired(command, timeout) from None
                     elapsed = int(time.monotonic() - started)
@@ -138,6 +243,9 @@ def run_stage(label, command, *, workspace, out, prompt=None, timeout=240, env=N
             raise
     stage_status(out, label, f"进程已退出，退出码 {code}。结果以回复或验收结论为准。", prompt is not None)
     print(f"[{label}] exit={code}", flush=True)
+    if code and accept_completed_reply:
+        if "already owned by an active write handle" in stderr.read_text(encoding="utf-8", errors="replace"):
+            raise RuntimeError("这个 DSH 会话正被桌面或另一个进程打开写入，CLI 已停止重试。可在原会话继续，或释放占用后再用命令行。")
     return code, stdout.read_text(encoding="utf-8", errors="replace")
 
 
@@ -159,7 +267,55 @@ def check_plugin():
         raise RuntimeError("WorkBuddy plugin not found. See DSH_WORKBUDDY_ENTRY in README.")
 
 
-def put_overlay(out, route=DEFAULT_ROUTE):
+def attach_dsh_workspace(out, workspace, session_id):
+    state_path = DSH_ROOT / "storages/workspace.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    groups = state.get("tables", {}).get("workspaces", {})
+    group = next((row for row in groups.values() if Path(row["path"]).resolve() == workspace), None)
+    if group is None:
+        raise RuntimeError("指定的目录尚未登记为 DSH 工作区。")
+    if session_id in group.get("sessionIds", []):
+        return
+    launcher = HERE / "attach_workspace.mjs"
+    if not launcher.is_file():
+        raise RuntimeError("未找到随 Skill 安装的 DSH 工作区登记工具。")
+    patch = [{"id": key, "disabled": True} for key in
+             ("llm-deepseek", "llm-deepseek-account", "session-title-llm")]
+    patch.append({"insert": [
+        {"id": "workspace", "name": "@deepseek-ai/dsh-workspace"},
+        {"id": "codex-attach-workspace", "name": launcher.as_posix(),
+         "config": {"workspace": str(workspace), "sessionId": session_id}},
+    ]})
+    patch_file = out / "workspace-attach.json"
+    patch_file.write_text(json.dumps(patch), encoding="utf-8")
+    result = subprocess.run(dsh_command("headless", "--patch", str(patch_file), "--json", "-"),
+                            cwd=workspace, env=dsh_environment(), stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=25, encoding="utf-8", errors="replace")
+    (out / "workspace-attach.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (out / "workspace-attach.stderr.log").write_text(result.stderr, encoding="utf-8")
+    updated = json.loads(state_path.read_text(encoding="utf-8"))
+    if result.returncode or not any(
+        Path(row["path"]).resolve() == workspace and session_id in row.get("sessionIds", [])
+        for row in updated["tables"]["workspaces"].values()
+    ):
+        raise RuntimeError(f"未能将原会话登记到指定 DSH 工作区。详见 {out / 'workspace-attach.stderr.log'}")
+    print(f"已将原会话登记到 DSH 工作区「{workspace.name}」。", flush=True)
+
+
+def remember_cli_session(out, workspace, events, previous, *, attach=False):
+    actual = cli_session(events, workspace)
+    if actual is None:
+        return previous
+    save_conversation(out, actual)
+    if attach:
+        try:
+            attach_dsh_workspace(out, workspace, actual)
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+            print(f"DSH 工作区登记待核对：{error}", file=sys.stderr, flush=True)
+    return actual
+
+
+def put_overlay(out, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=()):
     check_plugin()
     provider, model = ROUTES[route]
     region = "global" if provider == "workbuddy-global" else "cn"
@@ -202,6 +358,18 @@ def put_overlay(out, route=DEFAULT_ROUTE):
             "web-search-deepseek", "session-title-llm", "tool-web",
         )),
     ]
+    if inspect_roots or inspect_files:
+        plugin = HERE / "scoped_inspection.mjs"
+        if not plugin.is_file():
+            raise RuntimeError("未找到 DSH 只读取证工具。请核对 Skill 安装目录。")
+        overlay.append({"insert": [{
+            "id": "codex-scoped-inspection",
+            "name": plugin.as_posix(),
+            "config": {"roots": [
+                {"path": str(path), "text": path in inspect_files}
+                for path in dict.fromkeys((*inspect_roots, *inspect_files))
+            ]},
+        }]})
     path = out / f"workbuddy-{route}.json"
     path.write_text(json.dumps(overlay, indent=2), encoding="utf-8")
     return path
@@ -209,6 +377,10 @@ def put_overlay(out, route=DEFAULT_ROUTE):
 
 class DesktopFallbackRequired(RuntimeError):
     pass
+
+
+class DSHResponseError(RuntimeError):
+    """The selected WorkBuddy route could not supply a usable reply."""
 
 
 def read_session_events(session_id):
@@ -226,7 +398,7 @@ def read_session_events(session_id):
         raise RuntimeError("DSH 会话记录尚未写完或无法读取。") from error
 
 
-def verified_session_reply(workspace, prompt, session_id, route=DEFAULT_ROUTE):
+def verified_session_reply(workspace, prompt, session_id, route=DEFAULT_ROUTE, *, inspect=False):
     if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
         raise RuntimeError("请提供有效的 DSH 会话 ID。")
     events = read_session_events(session_id)
@@ -239,30 +411,59 @@ def verified_session_reply(workspace, prompt, session_id, route=DEFAULT_ROUTE):
             or not Path(cwd).is_absolute() or Path(cwd).resolve() != workspace.resolve()):
         raise RuntimeError("DSH 会话与接续工作区不匹配。")
 
-    # Generated runtime context is also recorded as user/message. Only compare
-    # the message explicitly sent by the person or desktop operator.
-    def entries(kind):
-        return [event["data"] for event in events if event.get("type") == kind]
-
-    # The desktop composer normalizes pasted line endings and trims outer whitespace.
+    # Locate the matching turn in the conversation, not other stages or older attempts.
     def composer_text(text):
         return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    users = [row for row in entries("user/message") if row.get("source", {}).get("kind") == "user"]
-    if (len(users) != 1 or len(users[0].get("content", [])) != 1
-            or users[0]["content"][0].get("type") != "text"
-            or composer_text(users[0]["content"][0].get("text", "")) != composer_text(prompt)):
+    latest = None
+    turn = []
+    for event in events[1:]:
+        kind = event.get("type")
+        if kind == "turn/start":
+            turn = [event]
+        elif turn:
+            turn.append(event)
+        if turn and kind == "user/message":
+            row = event.get("data", {})
+            content = row.get("content", [])
+            if (row.get("source", {}).get("kind") == "user" and len(content) == 1
+                    and content[0].get("type") == "text"
+                    and composer_text(content[0].get("text", "")) == composer_text(prompt)):
+                latest = turn
+        if kind == "turn/end":
+            turn = []
+    if latest is None:
         raise RuntimeError("DSH 会话中的消息与原始请求不匹配。")
+
+    def entries(kind):
+        return [event["data"] for event in latest if event.get("type") == kind]
+
+    users = [row for row in entries("user/message") if row.get("source", {}).get("kind") == "user"]
+    if len(users) != 1:
+        raise RuntimeError("原会话本轮又收到了其他消息，无法核对这条回复。")
+
     starts = entries("turn/start")
     ends = entries("turn/end")
     replies = entries("assistant/message")
-    if (len(starts) != 1 or len(ends) != 1 or len(replies) != 1
+    if (len(starts) != 1 or len(ends) != 1 or not replies or (not inspect and len(replies) != 1)
             or ends[0].get("reason", {}).get("kind") != "completed"
-            or replies[0].get("turn") != starts[0].get("turn")
+            or any(reply.get("turn") != starts[0].get("turn") for reply in replies)
             or ends[0].get("turn") != starts[0].get("turn")):
         raise RuntimeError("DSH 会话须有一次已经完成的回复。请等待写入或核对接续会话。")
+    if inspect:
+        expected = set()
+        for row in entries("tool/call"):
+            if row.get("name") != "codex_inspect":
+                continue
+            arguments = json.loads(row.get("arguments", "{}"))
+            if arguments.get("action") in ("list", "measure", "read_text"):
+                expected.add(row.get("callId"))
+        if not any(row.get("message", {}).get("toolCallId") in expected
+                   and row.get("message", {}).get("isError") is False
+                   for row in entries("tool/result")):
+            raise RuntimeError("DSH 会话没有完成的限定范围取证操作。")
 
-    message = replies[0].get("message", {})
+    message = replies[-1].get("message", {})
     config = [row.get("header", {}).get("config", {}) for row in entries("request/header")]
     origin = message.get("source", {})
     provider, model = ROUTES[route]
@@ -304,6 +505,15 @@ def read_cli_events(output):
     return events
 
 
+def finished_inspection(events):
+    calls = {row["callId"] for row in events
+             if row.get("type") == "tool_call" and row.get("tool") == "codex_inspect"
+             and row.get("input", {}).get("action") in ("list", "measure", "read_text")
+             and row.get("callId")}
+    return any(row.get("type") == "tool_result" and row.get("status") == "completed"
+               and row.get("callId") in calls for row in events)
+
+
 def bind_desktop_reply(out, tag, session_id, answer):
     path = out / f"{tag}.desktop-import.json"
     binding = {"session_id": session_id, "reply_sha256": sha256(answer.encode("utf-8")).hexdigest()}
@@ -326,11 +536,12 @@ def bind_desktop_reply(out, tag, session_id, answer):
         raise RuntimeError("本轮已绑定一个桌面会话及回复，请沿用首次导回的结果。")
 
 
-def recover_cli_reply(out, prompt, session_id, route=DEFAULT_ROUTE):
+def recover_cli_reply(out, prompt, session_id, route=DEFAULT_ROUTE, *, inspect=False):
     if not session_id:
         return None
     try:
-        answer = verified_session_reply(out, prompt, session_id, route)
+        options = {"inspect": True} if inspect else {}
+        answer = verified_session_reply(out, prompt, session_id, route, **options)
     except (OSError, RuntimeError):
         # No verified result yet. The same request can continue on the desktop.
         return None
@@ -341,11 +552,45 @@ def route_stage(tag, route):
     return tag if route == DEFAULT_ROUTE else f"{tag}.{route}"
 
 
+def desktop_record(out, tag, route):
+    return out / f"{route_stage(tag, route)}.desktop.json"
+
+
+def try_workbuddy_routes(out, routes, request):
+    desktop = None
+    response_error = None
+    for index, route in enumerate(routes):
+        try:
+            result = request(route)
+            session_id = conversation(out).get("session_id")
+            if session_id:
+                save_conversation(out, session_id, route)
+            return result
+        except DesktopFallbackRequired as error:
+            desktop = desktop or error
+            detail = "命令行未取得完整回复 " + str(error).removeprefix("DSH_DESKTOP_REQUIRED ")
+        except DSHResponseError as error:
+            response_error = error
+            detail = str(error)
+        if index + 1 < len(routes):
+            print(f"[{route}] {detail}；改试 {routes[index + 1]}。", flush=True)
+    if desktop is not None:
+        raise desktop
+    raise response_error
+
+
+def scoped_paths(transport):
+    return (*transport.get("inspect_roots", ()), *transport.get("inspect_files", ()))
+
+
 def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
-            desktop_session_id=None, route=DEFAULT_ROUTE):
+            desktop_session_id=None, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=(),
+            dsh_workspace=None):
+    workspace = dsh_workspace or out
     stage = route_stage(tag, route)
-    handoff = out / f"{stage}.desktop.json"
+    handoff = desktop_record(out, tag, route)
     provider, model = ROUTES[route]
+    inspect = {"inspect": True} if inspect_roots or inspect_files else {}
     # Distinguish identical tasks sent from different runs in the shared workspace.
     request_id = sha256(f"{out.resolve()}\n{stage}".encode("utf-8")).hexdigest()[:16]
     labeled_prompt = f"{prompt}\n\n协作记录编号：{request_id}\n"
@@ -363,13 +608,17 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
         if sha256(Path(record["request"]).read_bytes()).hexdigest() != record["prompt_sha256"]:
             raise RuntimeError("The saved desktop request was edited. Start a new review.")
         if desktop_session_id is None:
-            result = recover_cli_reply(out, prompt, record.get("headless_session_id"), route)
+            result = recover_cli_reply(workspace, prompt, record.get("headless_session_id"), route, **inspect)
             if result is not None:
                 return result
             raise DesktopFallbackRequired(f"DSH_DESKTOP_REQUIRED (already prepared): {handoff}")
-        if desktop_session_id == record.get("headless_session_id"):
+        bound = record.get("session_id")
+        if bound and desktop_session_id != bound:
+            raise RuntimeError("请在本任务已绑定的 DSH 会话内继续。")
+        if not bound and desktop_session_id == record.get("headless_session_id"):
             raise RuntimeError("请提供接续用的桌面会话 ID。")
-        answer = verified_session_reply(Path(record["workspace"]), prompt, desktop_session_id, route)
+        answer = verified_session_reply(Path(record["workspace"]), prompt, desktop_session_id, route,
+                                        **inspect)
         if desktop_answer is not None and desktop_answer.read_text(encoding="utf-8-sig").strip() != answer.strip():
             raise RuntimeError("回复文件与 DSH 会话中的答复不匹配。")
         bind_desktop_reply(out, tag, desktop_session_id, answer)
@@ -378,46 +627,67 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
         raise RuntimeError(f"No timed-out CLI request for {tag}.")
 
     prompt = labeled_prompt
-    print(f"[{stage}] WorkBuddy 路线：{provider}/{model}", flush=True)
+    session_id = task_session(out, workspace)
+    resume = ("--session-id", session_id) if session_id else ()
+    command = dsh_command("headless", "--patch", str(overlay), "--json",
+                          "--permission-mode", "read-only", "--approval-policy", "never", *resume, "-")
+    if not session_id:
+        # Reserve creation before starting a process that may persist a session before printing its ID.
+        save_conversation(out, None)
+    detail = f"沿用会话 {session_id}" if session_id else "创建本任务唯一会话"
+    print(f"[{stage}] WorkBuddy 路线：{provider}/{model}，{detail}", flush=True)
     try:
         code, events = run_stage(
-            stage,
-            dsh_command("headless", "--patch", str(overlay), "--json",
-                        "--permission-mode", "read-only", "--approval-policy", "never", "-"),
-            workspace=out, out=out, prompt=prompt, env=dsh_environment(), timeout=timeout,
+            stage, command,
+            workspace=workspace, out=out, prompt=prompt, env=dsh_environment(), timeout=timeout,
+            accept_completed_reply=True,
         )
     except subprocess.TimeoutExpired as error:
         events = read_cli_events((error.stdout or b"").decode("utf-8", errors="replace"))
+        session_id = remember_cli_session(out, workspace, events, session_id, attach=dsh_workspace is not None)
         result = completed_response(events)
+        if result is not None and result[1] == session_id and (not inspect or finished_inspection(events)):
+            return result
+        if session_id is None:
+            raise RuntimeError("超时前未取得 DSH 会话 ID，已停止重试以避免另开会话。") from error
+        last_phase = next((row.get("phase") for row in reversed(events)
+                           if row.get("type") == "status"), None)
+        result = recover_cli_reply(workspace, prompt, session_id, route, **inspect)
         if result is not None:
             return result
-        session_id = next((row.get("sessionId") for row in events if row.get("type") == "session"), None)
-        result = recover_cli_reply(out, prompt, session_id, route)
-        if result is not None:
-            return result
-        DESKTOP_WORKSPACE.mkdir(parents=True, exist_ok=True)
         request = out / f"{stage}.desktop-request.txt"
         request.write_bytes(prompt.encode("utf-8"))
         record = {
-            "workspace": str(DESKTOP_WORKSPACE),
+            "workspace": str(workspace),
+            "session_id": session_id,
             "request": str(request),
             "request_id": request_id,
             "provider": provider,
             "model": model,
             "headless_session_id": session_id,
+            "timeout_seconds": error.timeout,
+            "last_cli_phase": last_phase,
+            "read_only_investigation": bool(inspect),
             "prompt_sha256": sha256(prompt.encode("utf-8")).hexdigest(),
         }
         handoff.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        raise DesktopFallbackRequired(f"DSH_DESKTOP_REQUIRED ({timeout}s): {handoff}") from error
+        raise DesktopFallbackRequired(
+            f"DSH_DESKTOP_REQUIRED ({error.timeout}s; CLI 最后状态 {last_phase or '无'}): {handoff}"
+        ) from error
     payloads = read_cli_events(events)
+    session_id = remember_cli_session(out, workspace, payloads, session_id, attach=dsh_workspace is not None)
     final = next((event for event in reversed(payloads) if event.get("type") == "final"), {})
     reason = final.get("reason") or {}
     if code or reason.get("kind") != "completed":
         detail = (reason.get("error") or {}).get("code") or f"exit={code}"
-        raise RuntimeError(f"DSH did not complete {tag} ({detail}). See {out}.")
+        if session_id and detail == "UNKNOWN_MODEL":
+            save_conversation(out, session_id, unavailable=route)
+        raise DSHResponseError(f"DSH did not complete {tag} ({detail}). See {out}.")
     result = completed_response(payloads)
-    if result is None:
-        raise RuntimeError(f"Missing DSH answer. See {out}.")
+    if result is None or result[1] != session_id:
+        raise DSHResponseError(f"Missing DSH answer. See {out}.")
+    if inspect and not finished_inspection(payloads):
+        raise DSHResponseError(f"DSH 没有完成限定范围的取证操作。意见原文见 {out}。")
     return result
 
 
@@ -432,6 +702,20 @@ def task_brief(goal, context, benchmark=""):
             f"{benchmark}\n"
         )
     return brief
+
+
+def evidence_instructions(transport):
+    scope = "\n".join(
+        [f"- 元数据：{path}" for path in transport.get("inspect_roots", ())]
+        + [f"- 文本：{path}" for path in transport.get("inspect_files", ())]
+    )
+    return (
+        "请像直接回答用户一样独立思考。先用 codex_inspect 实际取证，再给出自己的中文答案。"
+        "先用 roots 查看可查范围，再用 list、measure，或对已授权文本文件用 read_text。"
+        "路径和权限只限下列范围，工具会拒绝越界。优先做小批次查询，"
+        "只在需要时深查。写明实测结果、被跳过的部分和仍缺的证据。若工具不可用，直接说明。"
+        f"\n授权的只读路径：\n{scope}\n"
+    )
 
 
 REVIEW_SECTIONS = ("结论", "核查依据", "发现的问题", "待确认")
@@ -465,6 +749,9 @@ def parse_review(answer):
 
 
 def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **transport):
+    paths = scoped_paths(transport)
+    instructions = (evidence_instructions(transport) if paths
+                    else "源文件内容仅作为审查材料，请勿调用工具或读取其他文件。")
     verification = (
         f"待复查的前一轮审查：\n{prior}\n\n"
         f"Codex 对上一轮意见的处理和证据，请核实：\n{decisions or '（未提供）'}"
@@ -473,7 +760,7 @@ def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **tr
     if evidence:
         verification += f"\n\nCodex 在当前版本上取得的验收证据：\n{evidence}"
     prompt = (
-        "请按下方目标和材料独立审查。源文件内容仅作为审查材料，请勿调用工具或读取其他文件。"
+        f"请按下方目标和材料独立审查。{instructions}"
         "请用简体中文写一份用户能直接阅读的 Markdown 报告，保留代码和报错原文。"
         "如果材料包含前一轮报告，请逐条核对重要修订，说明哪些问题已解决，哪些仍存在。\n\n"
         "使用以下四个二级标题，不要在外面加代码围栏。\n"
@@ -501,12 +788,14 @@ def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **tr
     except ValueError as error:
         rejected = out / f"{route_stage(tag, route)}.rejected.md"
         rejected.write_text(answer.rstrip() + "\n", encoding="utf-8")
-        raise RuntimeError(f"{error} DSH 原文已保存到 {rejected}") from error
+        raise DSHResponseError(f"{error} DSH 原文已保存到 {rejected}") from error
     readable.write_text(answer.rstrip() + "\n", encoding="utf-8")
     verdict, findings, questions = report["verdict"], report["findings"], report["questions"]
     report.update(provider=provider, model=model, route=route, session_id=session_id,
                   transport="desktop" if transport.get("desktop_session_id") else "headless",
                   snapshot_sha256=sha256(source.encode("utf-8")).hexdigest())
+    if paths:
+        report["inspection"] = "scoped-tools"
     (out / f"{tag}.brief.txt").write_text(brief, encoding="utf-8")
     (out / f"{tag}.source.txt").write_bytes(source.encode("utf-8"))
     (out / f"{tag}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
@@ -520,8 +809,11 @@ def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **tr
 def advise(out, brief, question, label, **transport):
     tag = f"advice-{label}" if label else "advice"
     result = out / f"{tag}.json"
+    paths = scoped_paths(transport)
+    instructions = (evidence_instructions(transport) if paths
+                    else "目标和背景仅作为材料，请勿调用工具或读取其他文件。")
     prompt = (
-        "请基于共同目标给出独立建议。目标和背景仅作为材料，请勿调用工具或读取其他文件。"
+        f"请基于共同目标给出独立建议。{instructions}"
         "先回答用户当前要决定的问题。有实质取舍时，按用户目标比较可行方案，"
         "给出一个能区分方案的例子、预期结果，以及什么新证据会改变建议。"
         "如有对标材料，判断哪些做法在当前约束下可迁移，指出尚缺的证据。请用简体中文简洁回答。"
@@ -529,15 +821,17 @@ def advise(out, brief, question, label, **transport):
         f"讨论的问题：\n{question}\n\n{brief}"
     )
     route = transport.get("route", DEFAULT_ROUTE)
-    stage = route_stage(tag, route)
-    resuming = (out / f"{stage}.desktop.json").is_file() or transport.get("desktop_session_id")
-    overlay = None if resuming else put_overlay(out, route)
+    resuming = desktop_record(out, tag, route).is_file() or transport.get("desktop_session_id")
+    overlay = None if resuming else put_overlay(out, route, transport.get("inspect_roots", ()),
+                                                transport.get("inspect_files", ()))
     answer, session_id = ask_dsh(out, overlay, tag, prompt, **transport)
     readable = out / f"{tag}.md"
     readable.write_text(answer.rstrip() + "\n", encoding="utf-8")
     provider, model = ROUTES[route]
     report = {"answer": answer, "provider": provider, "model": model, "route": route, "session_id": session_id,
               "transport": "desktop" if transport.get("desktop_session_id") else "headless"}
+    if paths:
+        report["inspection"] = "scoped-tools"
     result.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"DSH 已回复，建议原文：{readable}（{provider}/{model}，会话 {session_id}）", flush=True)
     return 0
@@ -563,6 +857,8 @@ def main():
     parser.add_argument("--check", nargs=argparse.REMAINDER,
                         help="Optional acceptance command. Put this option last.")
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--dsh-workspace", type=Path,
+                        help="可选，使用 DSH 中已有的绝对工作区目录，记录仍保存在 --run-dir。")
     parser.add_argument("--round", type=int, choices=range(1, MAX_REVIEWS + 1), default=1)
     parser.add_argument("--advice", help="Ask DSH for a second opinion, without running checks.")
     parser.add_argument("--advice-label", help="Optional unique suffix for an advice record.")
@@ -576,9 +872,13 @@ def main():
                         help="Codex's UTF-8 disposition of prior findings, for round 2.")
     parser.add_argument("--evidence", type=Path,
                         help="与本轮快照对应的 UTF-8 验收摘要，包含命令、结果和验证范围。")
-    parser.add_argument("--timeout", type=int, default=240, help="CLI model timeout in seconds.")
-    parser.add_argument("--route", choices=tuple(ROUTES), default=DEFAULT_ROUTE,
-                        help="WorkBuddy 路线，默认 cn-flash；回退时显式指定。")
+    parser.add_argument("--inspect-root", action="append", type=Path, default=[],
+                        help="授权 DSH 查看元数据的绝对路径，可重复。")
+    parser.add_argument("--inspect-file", action="append", type=Path, default=[],
+                        help="授权 DSH 读文本的单个绝对文件路径，可重复。")
+    parser.add_argument("--timeout", type=int, default=240, help="每条命令行模型路线的等待上限（秒）。")
+    parser.add_argument("--route", choices=("auto", *ROUTES), default="auto",
+                        help="默认依序尝试 WorkBuddy 路线；显式指定时只用该路线。")
     parser.add_argument("--desktop-answer", type=Path, help="可选，用于与会话原文比对的本地回复文件。")
     parser.add_argument("--desktop-session-id", help="导回并核对所选 WorkBuddy 路线的桌面会话 ID。")
     args = parser.parse_args()
@@ -598,12 +898,27 @@ def main():
         parser.error("--goal and --run-dir are required for advice and review")
     if args.timeout < 1:
         parser.error("--timeout must be positive")
+    if args.dsh_workspace is not None and (not args.dsh_workspace.is_absolute() or not args.dsh_workspace.is_dir()):
+        parser.error("--dsh-workspace 必须是已有的绝对工作区目录")
     if args.desktop_answer and not args.desktop_session_id:
         parser.error("--desktop-answer 需要同时提供 --desktop-session-id")
     if args.desktop_session_id and not SESSION_ID.fullmatch(args.desktop_session_id):
         parser.error("--desktop-session-id 需要有效的 DSH 会话 ID")
+    if any(not path.is_absolute() or not path.exists() or path.is_symlink()
+           for path in (*args.inspect_root, *args.inspect_file)):
+        parser.error("只读取证路径必须是已存在的物理绝对路径")
+    if any(not path.is_file() for path in args.inspect_file):
+        parser.error("--inspect-file 只接受明确授权的单个文本文件")
+    if args.desktop_session_id and (args.inspect_root or args.inspect_file):
+        parser.error("只读取证需要命令行的限定工具，不能导入没有同一工具限制的桌面会话。")
+    roots = tuple(dict.fromkeys(path.resolve() for path in args.inspect_root))
+    files = tuple(dict.fromkeys(path.resolve() for path in args.inspect_file))
     transport = dict(timeout=args.timeout, desktop_answer=args.desktop_answer,
-                     desktop_session_id=args.desktop_session_id, route=args.route)
+                     desktop_session_id=args.desktop_session_id)
+    if roots:
+        transport["inspect_roots"] = roots
+    if files:
+        transport["inspect_files"] = files
     if args.advice is not None:
         if not args.advice.strip():
             parser.error("--advice cannot be blank")
@@ -624,6 +939,24 @@ def main():
     if not goal.strip():
         parser.error("--goal file cannot be blank")
     out = args.run_dir.resolve()
+    with task_lock(out):
+        return run_task(args, parser, goal, out, transport)
+
+
+def run_task(args, parser, goal, out, transport):
+    dsh_workspace_record = out / "dsh-workspace.txt"
+    dsh_workspace = args.dsh_workspace.resolve() if args.dsh_workspace is not None else None
+    if dsh_workspace_record.is_file():
+        recorded = Path(dsh_workspace_record.read_text(encoding="utf-8"))
+        if not recorded.is_absolute() or (dsh_workspace is not None and dsh_workspace != recorded):
+            raise RuntimeError("DSH 工作区与已绑定的任务工作区不一致。")
+        dsh_workspace = recorded
+    elif dsh_workspace is not None:
+        if dsh_workspace != out and (conversation(out) or any(out.glob("*.stdout.log"))):
+            raise RuntimeError("已有 DSH 会话，不能更换它的工作区。")
+        dsh_workspace_record.write_text(str(dsh_workspace), encoding="utf-8")
+    if dsh_workspace is not None:
+        transport["dsh_workspace"] = dsh_workspace
     previous_workspace = out / "review-workspace.txt"
     if args.advice is not None:
         tag = f"advice-{args.advice_label}" if args.advice_label else "advice"
@@ -681,11 +1014,25 @@ def main():
         benchmark = ""
     else:
         benchmark = benchmark_snapshot.read_text(encoding="utf-8-sig") if benchmark_snapshot.exists() else ""
-    out.mkdir(parents=True, exist_ok=True)
     if not goal_snapshot.exists():
         goal_snapshot.write_text(goal, encoding="utf-8")
-    stage = route_stage(tag, args.route)
-    if not (out / f"{stage}.desktop.json").is_file():
+    if args.route == "auto":
+        state = conversation(out)
+        preferred = state.get("usable_route")
+        routes = tuple(sorted(ROUTES, key=lambda route: route != preferred))
+    else:
+        routes = (args.route,)
+    pending = tuple(route for route in routes if desktop_record(out, tag, route).is_file())
+    if args.desktop_session_id and args.route == "auto" and len(pending) != 1:
+        parser.error("导回桌面回复请用 --route 指定交接记录对应的路线。")
+    if pending:
+        # An existing handoff is a recovery request, not a fresh model run.
+        routes = pending
+    else:
+        if args.route == "auto":
+            routes = tuple(route for route in routes if route not in state.get("unavailable_routes", ()))
+            if not routes:
+                raise DSHResponseError("本任务的 WorkBuddy 路线都报告模型不可用。")
         if args.context:
             context_snapshot.write_text(context, encoding="utf-8")
         if args.benchmark or args.clear_benchmark:
@@ -693,12 +1040,20 @@ def main():
     brief = task_brief(goal, context, benchmark)
     print(f"Run record: {out}", flush=True)
     if args.advice is not None:
-        return advise(out, brief, args.advice, args.advice_label, **transport)
+        return try_workbuddy_routes(
+            out, routes, lambda route: advise(out, brief, args.advice, args.advice_label,
+                                              route=route, **transport)
+        )
     if not previous_workspace.exists():
         previous_workspace.write_text(str(workspace), encoding="utf-8")
-    resuming = (out / f"{stage}.desktop.json").is_file() or args.desktop_session_id
-    overlay = None if resuming else put_overlay(out, args.route)
-    verdict, questions = review(out, overlay, brief, source, tag, prior, decisions, evidence, **transport)
+    def request_review(route):
+        resuming = desktop_record(out, tag, route).is_file() or args.desktop_session_id
+        overlay = None if resuming else put_overlay(out, route, transport.get("inspect_roots", ()),
+                                                    transport.get("inspect_files", ()))
+        return review(out, overlay, brief, source, tag, prior, decisions, evidence,
+                      route=route, **transport)
+
+    verdict, questions = try_workbuddy_routes(out, routes, request_review)
     if args.check is not None:
         check_code, _ = run_stage(f"check-{args.round}", args.check,
                                   workspace=workspace, out=out)

@@ -36,9 +36,61 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not clone the skill' }
 | 想了解什么 | 从哪里看 |
 | --- | --- |
 | 全流程怎么跑 | [姓名去重示例](examples/README.md)提供一个有意保留缺陷的起点 |
-| 回复不可用或调用超时 | 查看[模型回退](references/workbuddy-routes.md)和[桌面接续](references/desktop-fallback.md) |
+| 回复不可用或调用超时 | 命令行自动试国内 Flash、国际 Flash，再试 Hy4，详见[模型回退](references/workbuddy-routes.md)和[桌面接续](references/desktop-fallback.md) |
 | 双方交流和验证证据 | [协作小结](references/presentation.md)链接中文原文和实测输出，`*.status.md` 带等待时间与日志入口 |
 | 需要系统查漏时用什么 | 可选 [ISO/IEC 25010:2023 检查表](references/product-quality.md)。讨论方案、排查卡点时，围绕当前最需要回答的问题展开 |
+| 怎么让 DSH 自己查证 | [独立取证与分工](references/model-collaboration.md#独立取证与分工)说明如何授权只读工具，让 Codex 同时推进其他工作 |
+| 怎么在一个 DSH 会话里来回交流 | [同会话协作与双向测试](#同会话协作与双向测试) |
+
+## 同会话协作与双向测试
+
+在 DSH 桌面侧栏添加一次共用工作区，后续任务复用同一个工作区。对 Codex 说：
+
+> 用 Codex + DSH 协作完成这个任务，放进 DSH 的「Codex + DSH 协作」工作区。同一个任务用同一条会话。让 DSH 自己挑需要实测的边界，你用本机工具验证，把实际结果回到原会话让它复查，最后你给结论。
+
+同一任务的讨论、审查和复查都用同一个运行目录。首次命令用 `--dsh-workspace` 传入 DSH 已登记的工作区绝对路径。团队可以把多个任务放在这个组里，每个任务分别绑定自己的会话 ID 和运行目录。
+
+### 从 PowerShell 调用
+
+以下使用仓库自带的[姓名去重示例](examples/README.md)。在仓库或 Skill 根目录运行，按提示输入实际的工作区路径。首次讨论会建立任务与会话的绑定。
+
+```powershell
+$runner = (Resolve-Path './scripts/run_dsh.py').Path
+$bridge = (Resolve-Path './scripts/bridge_tests.py').Path
+$goal = (Resolve-Path './examples/goal.txt').Path
+$testFile = (Resolve-Path './examples/verify.py').Path
+$workspace = (Resolve-Path -LiteralPath (Read-Host '输入 DSH 已登记的工作区文件夹路径')).Path
+$taskName = 'names-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+$record = Join-Path $HOME "Documents/Codex/dsh-collaboration/runs/$taskName"
+
+python -B $runner --run-dir $record --goal $goal --dsh-workspace $workspace --advice '独立分析目标和验收边界'
+if ($LASTEXITCODE -ne 0) { throw '请先检查首轮的 DSH 状态和输出' }
+python -B $bridge --run-dir $record --inspect-file $testFile
+```
+
+第二条命令让 DSH 通过 `codex_request_test` 登记测试输入和预期。完成后打开运行目录中的 `bridge-request.md` 和 `bridge-test-requests.json`。Codex 按原验收标准运行适合的本机测试，再制作 UTF-8 的 `bridge-codex-results.json`。数组中每个请求编号对应一条结果，例如：
+
+```json
+[
+  {
+    "request_id": "00000000-0000-0000-0000-000000000001",
+    "status": "failed",
+    "evidence": "把这里换成实际观察到的返回值、报错或未运行的原因"
+  }
+]
+```
+
+用原请求里的编号替换示例编号。状态可写 `passed`、`failed` 或 `not_run`。将可共享的实测结果带回原会话：
+
+```powershell
+python -B $bridge --run-dir $record --results (Join-Path $record 'bridge-codex-results.json')
+```
+
+DSH 调用 `codex_test_results` 读取证据，中文复查保存在 `bridge-results.md`，同时可以在 DSH 原会话里查看。Codex 根据实测和原验收标准决定是否改动。桥接使用任务上次可用的 WorkBuddy 路线，也可用 `--route` 显式选另一条已授权线路。
+
+### 侧栏位置和会话占用
+
+如果 CLI 报会话已被占用，或桌面仍将会话显示在「未分组」，先确认 DSH 当前任务已结束，再正常退出桌面。沿用原 `--run-dir` 完成 CLI 步骤后重开 DSH，在指定工作区查看原会话。运行目录里的 `dsh-conversation.json` 记录了会话 ID，可用于核对。
 
 ## 与项目调研与产品对标配合使用
 
@@ -50,7 +102,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not clone the skill' }
 
 ## 本地记录与验证
 
-每次任务把相关资料和各模型的回复集中保存。DSH 记录默认在 `~/Documents/Codex/dsh-collaboration/runs`，可以用 `DSH_COLLAB_DIR` 指定。将记录留在仓库外，只共享任务允许发送的材料。DSH 路线使用已有 WorkBuddy 积分，脚本关闭 DeepSeek 官方入口。
+每次任务把相关资料和各模型的回复集中保存。DSH 记录默认在 `~/Documents/Codex/dsh-collaboration/runs`，可以用 `DSH_COLLAB_DIR` 指定。演示对话、审查日志、测试请求与复查结果都留在本地运行目录。只共享任务允许发送的材料。DSH 路线使用已有 WorkBuddy 积分，脚本关闭 DeepSeek 官方入口。
 
 在仓库根目录运行 `python -X utf8 -B -m unittest discover -s tests -v`。GitHub Actions 在 Windows 的 Python 3.10 和 3.13 上跑同一套测试，无需 DSH 或 WorkBuddy 账号。真实模型调用可用上面的姓名去重示例验证。
 
