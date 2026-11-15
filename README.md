@@ -24,7 +24,7 @@ python -B (Join-Path $destination 'scripts/run_dsh.py') --doctor
 
 用 Git 安装后，可在 Skill 目录运行 `git pull --ff-only` 更新，再运行 `--doctor` 检查本地启动器。桌面位置和插件路径可分别用 `DSH_DESKTOP_DIR` 和 `DSH_WORKBUDDY_ENTRY` 覆盖，`DSH_HOME` 默认为 `~/.dsh`。`--doctor` 只检查文件和启动器版本。
 
-## 使用
+## 单独使用
 
 打开新的 Codex 对话，给一次目标：
 
@@ -35,9 +35,16 @@ python -B (Join-Path $destination 'scripts/run_dsh.py') --doctor
 | 想了解什么 | 从哪里看 |
 | --- | --- |
 | 全流程怎么跑 | [姓名去重示例](examples/README.md)提供一个有意保留缺陷的起点 |
-| 方案如何借鉴同类项目 | [项目对标](references/project-benchmark.md)说明如何查证和共享公开资料 |
 | 回复不可用或调用超时 | 查看[模型回退](references/workbuddy-routes.md)和[桌面接续](references/desktop-fallback.md) |
 | 双方交流和验证证据 | [协作小结](references/presentation.md)链接中文原文和实测输出，`*.status.md` 带等待时间与日志入口 |
+
+## 与项目调研与产品对标配合使用
+
+本 Skill 可独立用于讨论方案、排查卡点、审查和复查。需要先广找同类项目、核实哪些做法值得借鉴时，可以配合 [项目调研与产品对标](https://github.com/han139242/benchmark-product-workflows#安装)。只想做调研时，直接用对标 Skill 即可。
+
+> 用项目调研与产品对标、Codex + DSH 协作，优化工单列表返回后筛选丢失的问题。先核实同类做法，交叉检查方案，再改动。验收时同一账号刷新后应保留筛选，切换账号时应使用各自的状态。
+
+先用对标 Skill 查现状和同类做法，再由协作 Skill 把 `goal.txt` 中的同一目标、限制和验收标准，以及 `--benchmark` 指定的已核实摘录交给 DSH。DSH 提出遗漏、反例或替代方案，Codex 核实后作决定。需要复查改动时，用 `--evidence` 带上与验收相关的本机实测结果。参数和摘录格式见[项目对标说明](references/project-benchmark.md)。调研底稿和运行记录留在本地。
 
 ## 本地记录与验证
 
