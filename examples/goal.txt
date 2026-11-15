@@ -1,7 +1,5 @@
-Implement unique_names(names) in names.py for an iterable of strings.
-Trim surrounding whitespace and discard blank names. Keep only the first
-occurrence, in input order, and preserve that occurrence's trimmed spelling.
-Treat Unicode case variants (Straße / STRASSE) and canonically equivalent
-spellings (café with composed or decomposed accents) as equivalent. Retain the
-distinction between purely compatibility-equivalent spellings such as Ａ and A.
-Use the Python standard library. Acceptance: from examples, run python -B verify.py.
+在 names.py 中为字符串可迭代对象实现 unique_names(names)。
+去掉姓名首尾的空白并丢弃空姓名。按输入顺序去重，保留每个姓名第一次出现时去掉首尾空白后的拼写。
+Unicode 大小写变体（Straße / STRASSE）和规范等价的写法（例如 café 的预组合重音和分解重音）视为同名。
+仅有兼容等价关系的写法仍需区分，例如全角 Ａ 和半角 A。
+只使用 Python 标准库。在 examples 目录运行 python -B verify.py 验收。
