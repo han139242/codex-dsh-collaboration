@@ -1,4 +1,4 @@
 interface:
-  display_name: "Codex + DSH 协作"
-  short_description: "让当前 Codex 和 WorkBuddy DeepSeek 一起讨论方案、审查改动与复查"
+  display_name: "Codex + 多模型协作"
+  short_description: "让当前 Codex 和 DSH 或已有模型一起讨论、审查与复查"
   default_prompt: "用 $codex-dsh-collaboration 一起完成这个目标。"
