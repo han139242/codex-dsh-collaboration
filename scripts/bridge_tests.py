@@ -5,8 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from uuid import UUID
-
+from bridge_protocol import tool_results, verify_requests as check_requests, verify_results as check_results
 import run_dsh as dsh
 
 
@@ -15,45 +14,12 @@ REQUEST_TOOL = "codex_request_test"
 RESULTS_TOOL = "codex_test_results"
 
 
-def tool_results(events, name):
-    calls = {event["callId"] for event in events
-             if event.get("type") == "tool_call" and event.get("tool") == name and event.get("callId")}
-    return [json.loads(event["result"]) for event in events
-            if event.get("type") == "tool_result" and event.get("callId") in calls
-            and event.get("status") == "completed"]
-
-
 def verify_requests(requests):
-    if not isinstance(requests, list) or not 1 <= len(requests) <= 3:
-        raise RuntimeError("需要一至三项 DSH 工具请求。")
-    seen = set()
-    for item in requests:
-        if not isinstance(item, dict) or set(item) != {"request_id", "title", "input", "expected"}:
-            raise RuntimeError("测试请求格式不完整。")
-        if any(not isinstance(v, str) or not v.strip() or len(v) > 1200 for v in item.values()):
-            raise RuntimeError("测试请求包含无效字段。")
-        try:
-            canonical_id = str(UUID(item["request_id"]))
-        except ValueError as error:
-            raise RuntimeError("测试请求编号无效。") from error
-        if canonical_id != item["request_id"] or canonical_id in seen:
-            raise RuntimeError("测试请求编号无效或重复。")
-        seen.add(canonical_id)
-    return seen
+    return check_requests(requests, ("title", "input", "expected"))
 
 
 def verify_results(requests, results):
-    expected = verify_requests(requests)
-    if not isinstance(results, list) or len(results) != len(expected):
-        raise RuntimeError("每条原请求都需要一条执行结果或未执行原因。")
-    for item in results:
-        if (not isinstance(item, dict) or set(item) != {"request_id", "status", "evidence"}
-                or not isinstance(item["request_id"], str) or item["request_id"] not in expected
-                or item["status"] not in ("passed", "failed", "not_run")
-                or not isinstance(item["evidence"], str) or not item["evidence"].strip()
-                or len(item["evidence"]) > 4000):
-            raise RuntimeError("结果编号或证据无效。")
-        expected.remove(item["request_id"])
+    check_results(verify_requests(requests), results, ("passed", "failed", "not_run"))
 
 
 def bridge_turn(out, workspace, session_id, route, roots, mode, results, timeout):

@@ -88,6 +88,40 @@ python -B $bridge --run-dir $record --results (Join-Path $record 'bridge-codex-r
 
 DSH 调用 `codex_test_results` 读取证据，中文复查保存在 `bridge-results.md`，同时可以在 DSH 原会话里查看。Codex 根据实测和原验收标准决定是否改动。桥接使用任务上次可用的 WorkBuddy 路线，也可用 `--route` 显式选另一条已授权线路。
 
+### 让 DSH 主动请 Codex 查证
+
+在 Codex 里可以只说一次目标：
+
+> 用 Codex + DSH 协作完成这个任务。让 DSH 独立判断，遇到影响结论的疑点就请你核对授权文件、查公开资料或诊断卡点。把实测和来源送回原会话，让它重新判断，最后由你决定。
+
+从 PowerShell 手动调用时，沿用上一节的 `$runner`、`$record`、`$goal` 和 `$workspace`。用 `--ask-codex` 允许 DSH 主动登记查证问题。证据够用时直接生成报告，退出码 4 表示需要 Codex 查证。
+
+```powershell
+$inquiryArgs = @('--run-dir', $record, '--goal', $goal, '--dsh-workspace', $workspace,
+    '--advice-label', 'verification', '--advice', '独立判断 Unicode 去重的验收边界', '--ask-codex')
+python -B $runner @inquiryArgs
+```
+
+收到退出码 4 后，查看 `bridge-evidence-advice-verification.json`，同时可读同名 Markdown。按每条请求的编号，在授权范围内核对文件事实、公开一手来源或诊断结果。将每条结果写成 UTF-8 JSON，保存为 `bridge-codex-evidence.json`。
+
+```json
+[
+  {
+    "request_id": "00000000-0000-0000-0000-000000000001",
+    "status": "verified",
+    "evidence": "填写实际核对到的事实，并附文件位置、公开来源或运行结果"
+  }
+]
+```
+
+用实际请求编号替换示例。如果证据不足或无法查证，分别用 `inconclusive` 或 `not_checked` 并说明原因。用原参数回传：
+
+```powershell
+python -B $runner @inquiryArgs --codex-results (Join-Path $record 'bridge-codex-evidence.json')
+```
+
+脚本在原 DSH 会话交回证据，确认 DSH 读到了对应结果后才生成正式报告。Codex 依据证据和原验收标准作最终决定。审查命令带 `--check` 时，把 `--codex-results` 加在它前面。详见[同会话查证](references/model-collaboration.md#同会话查证)。
+
 ### 侧栏位置和会话占用
 
 如果 CLI 报会话已被占用，或桌面仍将会话显示在「未分组」，先确认 DSH 当前任务已结束，再正常退出桌面。沿用原 `--run-dir` 完成 CLI 步骤后重开 DSH，在指定工作区查看原会话。运行目录里的 `dsh-conversation.json` 记录了会话 ID，可用于核对。
@@ -102,7 +136,7 @@ DSH 调用 `codex_test_results` 读取证据，中文复查保存在 `bridge-res
 
 ## 本地记录与验证
 
-每次任务把相关资料和各模型的回复集中保存。DSH 记录默认在 `~/Documents/Codex/dsh-collaboration/runs`，可以用 `DSH_COLLAB_DIR` 指定。演示对话、审查日志、测试请求与复查结果都留在本地运行目录。只共享任务允许发送的材料。DSH 路线使用已有 WorkBuddy 积分，脚本关闭 DeepSeek 官方入口。
+每次任务把相关资料和各模型的回复集中保存。DSH 记录默认在 `~/Documents/Codex/dsh-collaboration/runs`，可以用 `DSH_COLLAB_DIR` 指定。演示对话、审查日志、查证请求、回传证据和复查结果都留在本地运行目录。只共享任务允许发送的材料。DSH 路线使用已有 WorkBuddy 积分，脚本关闭 DeepSeek 官方入口。
 
 在仓库根目录运行 `python -X utf8 -B -m unittest discover -s tests -v`。GitHub Actions 在 Windows 的 Python 3.10 和 3.13 上跑同一套测试，无需 DSH 或 WorkBuddy 账号。真实模型调用可用上面的姓名去重示例验证。
 

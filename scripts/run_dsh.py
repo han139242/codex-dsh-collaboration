@@ -12,6 +12,8 @@ import sys
 import tempfile
 import time
 
+from bridge_protocol import EVIDENCE_REQUEST, EVIDENCE_RESULTS, evidence_request_ids, tool_results, verify_results
+
 
 HERE = Path(__file__).resolve().parent
 MODEL = "deepseek-v4.1-flash"
@@ -27,6 +29,7 @@ ROUTES = {
 SESSION_ID = re.compile(r"session-[\da-fA-F]{8}(?:-[\da-fA-F]{4}){3}-[\da-fA-F]{12}")
 MAX_REVIEWS = 2
 DESKTOP_FALLBACK_EXIT = 3
+CODEX_EVIDENCE_EXIT = 4
 PROGRESS_INTERVAL = 15
 STOP_TIMEOUT = 5
 CONVERSATION_RECORD = "dsh-conversation.json"
@@ -315,7 +318,7 @@ def remember_cli_session(out, workspace, events, previous, *, attach=False):
     return actual
 
 
-def put_overlay(out, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=()):
+def put_overlay(out, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=(), *, evidence_bridge=None):
     check_plugin()
     provider, model = ROUTES[route]
     region = "global" if provider == "workbuddy-global" else "cn"
@@ -358,7 +361,7 @@ def put_overlay(out, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=()):
             "web-search-deepseek", "session-title-llm", "tool-web",
         )),
     ]
-    if inspect_roots or inspect_files:
+    if inspect_roots or inspect_files or evidence_bridge:
         plugin = HERE / "scoped_inspection.mjs"
         if not plugin.is_file():
             raise RuntimeError("未找到 DSH 只读取证工具。请核对 Skill 安装目录。")
@@ -370,12 +373,18 @@ def put_overlay(out, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=()):
                 for path in dict.fromkeys((*inspect_roots, *inspect_files))
             ]},
         }]})
+        if evidence_bridge:
+            overlay[-1]["insert"][0]["config"]["evidenceBridge"] = evidence_bridge
     path = out / f"workbuddy-{route}.json"
     path.write_text(json.dumps(overlay, indent=2), encoding="utf-8")
     return path
 
 
 class DesktopFallbackRequired(RuntimeError):
+    pass
+
+
+class CodexEvidencePending(RuntimeError):
     pass
 
 
@@ -583,14 +592,77 @@ def scoped_paths(transport):
     return (*transport.get("inspect_roots", ()), *transport.get("inspect_files", ()))
 
 
+def evidence_receipt(out, tag):
+    return out / f"bridge-evidence-{tag}.json"
+
+
+def capture_evidence_requests(out, tag, prompt, route, events, result):
+    requests = tool_results(events, EVIDENCE_REQUEST)
+    if not requests:
+        return
+    evidence_request_ids(requests)
+    answer, session_id = result
+    receipt = evidence_receipt(out, tag)
+    (out / f"bridge-evidence-{tag}.md").write_text(answer.rstrip() + "\n", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "session_id": session_id,
+        "route": route,
+        "prompt_sha256": sha256(prompt.encode("utf-8")).hexdigest(),
+        "requests": requests,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_conversation(out, session_id, route)
+    raise CodexEvidencePending(f"DSH 等待 Codex 查证：{receipt}")
+
+
+def continue_with_evidence(out, tag, route, workspace, prompt, results_file, timeout):
+    receipt = json.loads(evidence_receipt(out, tag).read_text(encoding="utf-8"))
+    session_id = conversation(out).get("session_id")
+    if not session_id or receipt.get("session_id") != session_id:
+        raise RuntimeError("证据请求与本任务的 DSH 会话不一致。")
+    if receipt.get("prompt_sha256") != sha256(prompt.encode("utf-8")).hexdigest():
+        raise RuntimeError("原问题或材料已变化。请使用登记证据请求时的同一阶段与材料。")
+    results = json.loads(results_file.read_text(encoding="utf-8-sig"))
+    verify_results(evidence_request_ids(receipt["requests"]), results,
+                   ("verified", "inconclusive", "not_checked"))
+    overlay = put_overlay(out, route, evidence_bridge={"mode": "results", "results": results})
+    stage = route_stage(f"bridge-evidence-{tag}-results", route)
+    followup = (
+        "继续原会话。先调用 codex_evidence_results，读出 Codex 核实后回传的证据。"
+        "按编号逐条核对与原问题的关系，说明哪些结论因此改变、哪些还缺证据。"
+        "以原问题所要求的格式给出最终中文判断。本轮用已取得的证据收敛。\n\n"
+        f"原问题和材料：\n{prompt}\n"
+    )
+    command = dsh_command("headless", "--patch", str(overlay), "--json",
+                          "--permission-mode", "read-only", "--approval-policy", "never",
+                          "--session-id", session_id, "-")
+    code, output = run_stage(stage, command, workspace=workspace, out=out, prompt=followup,
+                             timeout=timeout, env=dsh_environment(), accept_completed_reply=True)
+    events = read_cli_events(output)
+    result = completed_response(events)
+    if (code or result is None or result[1] != session_id or cli_session(events, workspace) != session_id
+            or results not in tool_results(events, EVIDENCE_RESULTS)):
+        raise RuntimeError(f"DSH 未在原会话完成证据复查。详见 {out / (stage + '.status.md')}")
+    return result
+
+
+def collaboration_overlay(out, route, transport):
+    return put_overlay(out, route, transport.get("inspect_roots", ()), transport.get("inspect_files", ()),
+                       evidence_bridge={"mode": "request"} if transport.get("ask_codex") else None)
+
+
 def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
             desktop_session_id=None, route=DEFAULT_ROUTE, inspect_roots=(), inspect_files=(),
-            dsh_workspace=None):
+            dsh_workspace=None, ask_codex=False, codex_results=None):
     workspace = dsh_workspace or out
+    if codex_results is not None:
+        return continue_with_evidence(out, tag, route, workspace, prompt, codex_results, timeout)
+    if evidence_receipt(out, tag).is_file():
+        raise CodexEvidencePending(f"DSH 等待 Codex 查证：{evidence_receipt(out, tag)}")
     stage = route_stage(tag, route)
     handoff = desktop_record(out, tag, route)
     provider, model = ROUTES[route]
     inspect = {"inspect": True} if inspect_roots or inspect_files else {}
+    original_prompt = prompt
     # Distinguish identical tasks sent from different runs in the shared workspace.
     request_id = sha256(f"{out.resolve()}\n{stage}".encode("utf-8")).hexdigest()[:16]
     labeled_prompt = f"{prompt}\n\n协作记录编号：{request_id}\n"
@@ -608,7 +680,8 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
         if sha256(Path(record["request"]).read_bytes()).hexdigest() != record["prompt_sha256"]:
             raise RuntimeError("The saved desktop request was edited. Start a new review.")
         if desktop_session_id is None:
-            result = recover_cli_reply(workspace, prompt, record.get("headless_session_id"), route, **inspect)
+            result = (None if ask_codex else
+                      recover_cli_reply(workspace, prompt, record.get("headless_session_id"), route, **inspect))
             if result is not None:
                 return result
             raise DesktopFallbackRequired(f"DSH_DESKTOP_REQUIRED (already prepared): {handoff}")
@@ -646,13 +719,16 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
         events = read_cli_events((error.stdout or b"").decode("utf-8", errors="replace"))
         session_id = remember_cli_session(out, workspace, events, session_id, attach=dsh_workspace is not None)
         result = completed_response(events)
-        if result is not None and result[1] == session_id and (not inspect or finished_inspection(events)):
-            return result
+        if result is not None and result[1] == session_id:
+            if ask_codex:
+                capture_evidence_requests(out, tag, original_prompt, route, events, result)
+            if not inspect or finished_inspection(events):
+                return result
         if session_id is None:
             raise RuntimeError("超时前未取得 DSH 会话 ID，已停止重试以避免另开会话。") from error
         last_phase = next((row.get("phase") for row in reversed(events)
                            if row.get("type") == "status"), None)
-        result = recover_cli_reply(workspace, prompt, session_id, route, **inspect)
+        result = None if ask_codex else recover_cli_reply(workspace, prompt, session_id, route, **inspect)
         if result is not None:
             return result
         request = out / f"{stage}.desktop-request.txt"
@@ -667,7 +743,7 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
             "headless_session_id": session_id,
             "timeout_seconds": error.timeout,
             "last_cli_phase": last_phase,
-            "read_only_investigation": bool(inspect),
+            "read_only_investigation": bool(inspect or ask_codex),
             "prompt_sha256": sha256(prompt.encode("utf-8")).hexdigest(),
         }
         handoff.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -686,6 +762,8 @@ def ask_dsh(out, overlay, tag, prompt, *, timeout=240, desktop_answer=None,
     result = completed_response(payloads)
     if result is None or result[1] != session_id:
         raise DSHResponseError(f"Missing DSH answer. See {out}.")
+    if ask_codex:
+        capture_evidence_requests(out, tag, original_prompt, route, payloads, result)
     if inspect and not finished_inspection(payloads):
         raise DSHResponseError(f"DSH 没有完成限定范围的取证操作。意见原文见 {out}。")
     return result
@@ -716,6 +794,24 @@ def evidence_instructions(transport):
         "只在需要时深查。写明实测结果、被跳过的部分和仍缺的证据。若工具不可用，直接说明。"
         f"\n授权的只读路径：\n{scope}\n"
     )
+
+
+def collaboration_instructions(transport, static_instructions):
+    if scoped_paths(transport):
+        instructions = evidence_instructions(transport)
+    elif transport.get("ask_codex"):
+        instructions = "请在给定材料范围内独立判断。"
+    else:
+        return static_instructions
+    if transport.get("ask_codex"):
+        instructions += (
+            "若一个缺失的事实会改变判断、且现有材料与已授权工具无法查到，"
+            "用 codex_request_evidence 主动请 Codex 查证。"
+            "类型选 file（已授权文件）、research（公开资料）或 blocker（卡点诊断），"
+            "写清具体问题和它为什么影响结论。先说明根据现有证据能判断什么，再等待查证。"
+            "现有证据足够时直接给出判断。\n"
+        )
+    return instructions
 
 
 REVIEW_SECTIONS = ("结论", "核查依据", "发现的问题", "待确认")
@@ -750,8 +846,7 @@ def parse_review(answer):
 
 def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **transport):
     paths = scoped_paths(transport)
-    instructions = (evidence_instructions(transport) if paths
-                    else "源文件内容仅作为审查材料，请勿调用工具或读取其他文件。")
+    instructions = collaboration_instructions(transport, "源文件内容仅作为审查材料，请勿调用工具或读取其他文件。")
     verification = (
         f"待复查的前一轮审查：\n{prior}\n\n"
         f"Codex 对上一轮意见的处理和证据，请核实：\n{decisions or '（未提供）'}"
@@ -794,7 +889,9 @@ def review(out, overlay, brief, source, tag, prior, decisions, evidence="", **tr
     report.update(provider=provider, model=model, route=route, session_id=session_id,
                   transport="desktop" if transport.get("desktop_session_id") else "headless",
                   snapshot_sha256=sha256(source.encode("utf-8")).hexdigest())
-    if paths:
+    if transport.get("codex_results"):
+        report["codex_evidence"] = evidence_receipt(out, tag).name
+    elif paths:
         report["inspection"] = "scoped-tools"
     (out / f"{tag}.brief.txt").write_text(brief, encoding="utf-8")
     (out / f"{tag}.source.txt").write_bytes(source.encode("utf-8"))
@@ -810,8 +907,7 @@ def advise(out, brief, question, label, **transport):
     tag = f"advice-{label}" if label else "advice"
     result = out / f"{tag}.json"
     paths = scoped_paths(transport)
-    instructions = (evidence_instructions(transport) if paths
-                    else "目标和背景仅作为材料，请勿调用工具或读取其他文件。")
+    instructions = collaboration_instructions(transport, "目标和背景仅作为材料，请勿调用工具或读取其他文件。")
     prompt = (
         f"请基于共同目标给出独立建议。{instructions}"
         "先回答用户当前要决定的问题。有实质取舍时，按用户目标比较可行方案，"
@@ -822,15 +918,16 @@ def advise(out, brief, question, label, **transport):
     )
     route = transport.get("route", DEFAULT_ROUTE)
     resuming = desktop_record(out, tag, route).is_file() or transport.get("desktop_session_id")
-    overlay = None if resuming else put_overlay(out, route, transport.get("inspect_roots", ()),
-                                                transport.get("inspect_files", ()))
+    overlay = None if resuming or transport.get("codex_results") else collaboration_overlay(out, route, transport)
     answer, session_id = ask_dsh(out, overlay, tag, prompt, **transport)
     readable = out / f"{tag}.md"
     readable.write_text(answer.rstrip() + "\n", encoding="utf-8")
     provider, model = ROUTES[route]
     report = {"answer": answer, "provider": provider, "model": model, "route": route, "session_id": session_id,
               "transport": "desktop" if transport.get("desktop_session_id") else "headless"}
-    if paths:
+    if transport.get("codex_results"):
+        report["codex_evidence"] = evidence_receipt(out, tag).name
+    elif paths:
         report["inspection"] = "scoped-tools"
     result.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"DSH 已回复，建议原文：{readable}（{provider}/{model}，会话 {session_id}）", flush=True)
@@ -876,6 +973,8 @@ def main():
                         help="授权 DSH 查看元数据的绝对路径，可重复。")
     parser.add_argument("--inspect-file", action="append", type=Path, default=[],
                         help="授权 DSH 读文本的单个绝对文件路径，可重复。")
+    parser.add_argument("--ask-codex", action="store_true", help="允许 DSH 主动请 Codex 查证关键事实。")
+    parser.add_argument("--codex-results", type=Path, help="沿用原命令，用此文件回传匹配的查证结果。")
     parser.add_argument("--timeout", type=int, default=240, help="每条命令行模型路线的等待上限（秒）。")
     parser.add_argument("--route", choices=("auto", *ROUTES), default="auto",
                         help="默认依序尝试 WorkBuddy 路线；显式指定时只用该路线。")
@@ -909,12 +1008,16 @@ def main():
         parser.error("只读取证路径必须是已存在的物理绝对路径")
     if any(not path.is_file() for path in args.inspect_file):
         parser.error("--inspect-file 只接受明确授权的单个文本文件")
-    if args.desktop_session_id and (args.inspect_root or args.inspect_file):
+    if args.desktop_session_id and (args.inspect_root or args.inspect_file or args.ask_codex or args.codex_results):
         parser.error("只读取证需要命令行的限定工具，不能导入没有同一工具限制的桌面会话。")
     roots = tuple(dict.fromkeys(path.resolve() for path in args.inspect_root))
     files = tuple(dict.fromkeys(path.resolve() for path in args.inspect_file))
     transport = dict(timeout=args.timeout, desktop_answer=args.desktop_answer,
                      desktop_session_id=args.desktop_session_id)
+    if args.ask_codex or args.codex_results:
+        transport["ask_codex"] = True
+    if args.codex_results:
+        transport["codex_results"] = args.codex_results
     if roots:
         transport["inspect_roots"] = roots
     if files:
@@ -1025,7 +1128,13 @@ def run_task(args, parser, goal, out, transport):
     pending = tuple(route for route in routes if desktop_record(out, tag, route).is_file())
     if args.desktop_session_id and args.route == "auto" and len(pending) != 1:
         parser.error("导回桌面回复请用 --route 指定交接记录对应的路线。")
-    if pending:
+    if args.codex_results:
+        receipt = json.loads(evidence_receipt(out, tag).read_text(encoding="utf-8"))
+        route = receipt.get("route") if args.route == "auto" else args.route
+        if route not in ROUTES:
+            raise RuntimeError("证据请求的 WorkBuddy 路线无效。")
+        routes = (route,)
+    elif pending:
         # An existing handoff is a recovery request, not a fresh model run.
         routes = pending
     else:
@@ -1048,8 +1157,7 @@ def run_task(args, parser, goal, out, transport):
         previous_workspace.write_text(str(workspace), encoding="utf-8")
     def request_review(route):
         resuming = desktop_record(out, tag, route).is_file() or args.desktop_session_id
-        overlay = None if resuming else put_overlay(out, route, transport.get("inspect_roots", ()),
-                                                    transport.get("inspect_files", ()))
+        overlay = None if resuming or transport.get("codex_results") else collaboration_overlay(out, route, transport)
         return review(out, overlay, brief, source, tag, prior, decisions, evidence,
                       route=route, **transport)
 
@@ -1087,6 +1195,9 @@ if __name__ == "__main__":
     except DesktopFallbackRequired as error:
         print(error, file=sys.stderr)
         sys.exit(DESKTOP_FALLBACK_EXIT)
+    except CodexEvidencePending as error:
+        print(error, file=sys.stderr)
+        sys.exit(CODEX_EVIDENCE_EXIT)
     except KeyboardInterrupt:
         print("本轮已中断。", file=sys.stderr)
         sys.exit(130)

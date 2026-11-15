@@ -404,6 +404,51 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual((report["provider"], report["model"], report["route"]),
                          ("workbuddy-global", run_dsh.MODEL, "global-flash"))
 
+    def test_pending_evidence_pauses_review_until_same_session_reads_actual_results(self):
+        answer, session_id = self.review_reply()
+        request_id = "00000000-0000-0000-0000-000000000023"
+        request = {"request_id": request_id, "kind": "file", "question": "默认值是什么？", "why": "影响验收"}
+        results = [{"request_id": request_id, "status": "verified", "evidence": "配置所用默认值是 safe。"}]
+
+        def completion(text, tool=None, payload=None):
+            events = []
+            if tool:
+                events += [{"type": "tool_call", "tool": tool, "callId": "evidence"},
+                           {"type": "tool_result", "callId": "evidence", "status": "completed",
+                            "result": json.dumps(payload)}]
+            events.append({"type": "final", "reason": {"kind": "completed"}, "text": text, "sessionId": session_id})
+            return 0, "\n".join(map(json.dumps, events))
+
+        flags = (*self.review_args, "--ask-codex")
+        results_path = self.source.parent / "evidence.json"
+        with patch.object(run_dsh, "dsh_command", side_effect=lambda *args: list(args)), \
+                patch.object(run_dsh, "run_stage", side_effect=[
+                    completion("需要查证", run_dsh.EVIDENCE_REQUEST, request),
+                    completion(answer),
+                    completion(answer, run_dsh.EVIDENCE_RESULTS, results),
+                ]) as stage:
+            with self.assertRaises(run_dsh.CodexEvidencePending):
+                self.run_main(*flags)
+            with self.assertRaises(run_dsh.CodexEvidencePending):
+                self.run_main(*self.review_args)
+            receipt = run_dsh.evidence_receipt(self.record, "review-1")
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["requests"], [request])
+            results_path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "每条原请求"):
+                self.run_main(*flags, "--codex-results", str(results_path))
+            stage.assert_called_once()
+            results_path.write_text(json.dumps(results), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "未在原会话完成证据复查"):
+                self.run_main(*flags, "--codex-results", str(results_path))
+            self.assertFalse((self.record / "review-1.json").exists())
+            self.assertEqual(self.run_main(*flags, "--codex-results", str(results_path)), 0)
+        self.assertIn("主动请 Codex 查证", stage.call_args_list[0].kwargs["prompt"])
+        for invocation in stage.call_args_list[1:]:
+            command = invocation.args[1]
+            self.assertEqual(command[command.index("--session-id") + 1], session_id)
+        report = json.loads((self.record / "review-1.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["codex_evidence"], receipt.name)
+
     def test_auto_cli_timeout_falls_back_in_order_before_returning_a_real_finding(self):
         timeout_output = model_started() + b'{"type":"status","phase":"step_start"}\n'
         timeout = subprocess.TimeoutExpired("fake-dsh", 1, output=timeout_output)

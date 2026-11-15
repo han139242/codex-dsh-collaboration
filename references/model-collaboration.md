@@ -61,6 +61,27 @@ python -B $bridge --run-dir $record --results "$record/bridge-codex-results.json
 
 第二条命令让 DSH 调用 `codex_test_results` 读取同编号结果，再在原对话给出中文复查。只有工具确实返回了结果且模型完成回复，才保存 `bridge-results.md`。桥按任务记录中已有的 WorkBuddy 路线接续，可用 `--route` 选择另一条已授权路线。桌面持有写入权时，等写入权释放再接续同一会话。Codex 最后根据测试和原验收条件作决定。
 
+## 同会话查证
+
+讨论、审查或复查需要 DSH 主动请 Codex 补证时，在原命令加 `--ask-codex`。仍允许 DSH 先用 `--inspect-file`、`--inspect-root` 已授权的只读工具。缺少关键证据时，DSH 可用 `codex_request_evidence` 登记一至三个具体问题，说明每条可能改变什么判断。证据足够时，原流程直接生成报告。
+
+| 请求类型 | Codex 如何查证 |
+| --- | --- |
+| `file` | 在任务授权的文件范围内核对指定事实，回传相关行和结论 |
+| `research` | 查公开一手来源，带上结论、版本或日期以及链接 |
+| `blocker` | 用已授权的环境、日志或最小验证区分原因，回传实际现象和结果 |
+
+脚本退出码 4 表示有未处理的证据请求。读取 `bridge-evidence-<阶段>.json` 的编号和问题，中文阶段意见保存在同名 Markdown。每个请求对应一条 UTF-8 JSON 结果，字段为 `request_id`、`status`、`evidence`。状态为 `verified`、`inconclusive` 或 `not_checked`。只回传获准共享的证据摘要和定位信息；越界或查不到时写明原因。工具只登记问题，Codex 自己选择读哪些文件、访问哪些公开来源和执行哪些已授权检查。
+
+```powershell
+$requestArgs = @('--run-dir', $record, '--goal', "$record/goal.txt", '--advice-label', 'diagnosis', '--advice', '独立排查卡点', '--ask-codex')
+python -B $runner @requestArgs
+# 仅退出码 4 时，先逐条查证，再回传
+python -B $runner @requestArgs --codex-results "$record/bridge-codex-evidence.json"
+```
+
+回传沿用原运行目录、阶段和输入材料。审查带有 `--check` 时，把 `--codex-results` 写在 `--check` 之前。脚本校验会话和请求编号，只有 DSH 实际调用 `codex_evidence_results` 读回对应证据并完成回答，才写正式报告并进入原有验收。一个阶段的回传收敛为一次复查。发现新的关键疑点时，按原任务需要选择后续讨论或复查，继续复用同一会话。
+
 ## 有关键分歧时怎么核查
 
 

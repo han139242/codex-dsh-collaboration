@@ -7,6 +7,8 @@ export const inject = ['tools']
 const toolName = 'codex_inspect'
 const testRequest = 'codex_request_test'
 const testResult = 'codex_test_results'
+const evidenceRequest = 'codex_request_evidence'
+const evidenceResult = 'codex_evidence_results'
 const blocked = /^(\.git|\.env(?:\..*)?|\.credentials(?:\..*)?|credentials|secrets|xwechat_files|wechat files|session-backup)$/i
 
 function outside(root, path) {
@@ -95,13 +97,53 @@ export async function apply(ctx, config) {
     roots.push({ path, text: Boolean(entry.text) })
   }
   const bridge = config.testBridge
-  if (roots.length === 0 && !bridge) throw new Error('At least one inspection root is required.')
+  const evidence = config.evidenceBridge
+  if (!roots.length && !bridge && !evidence) throw new Error('At least one scoped tool is required.')
   const allowed = new Set()
   if (roots.length) allowed.add(toolName)
   if (bridge?.mode === 'request') allowed.add(testRequest)
   if (bridge?.mode === 'results') allowed.add(testResult)
+  if (evidence?.mode === 'request') allowed.add(evidenceRequest)
+  if (evidence?.mode === 'results') allowed.add(evidenceResult)
   ctx.tools.guard(exec => allowed.has(exec.name) ? undefined : 'Only the scoped tools approved for this turn may be used.')
   const textOutput = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
+
+  if (evidence?.mode === 'request') {
+    let requested = 0
+    ctx.tools.register({
+      name: evidenceRequest,
+      description: 'Ask Codex to check one missing fact that could change your judgment. Use file for an authorized file, research for a public source, or blocker for a diagnostic check. This registers a question only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['file', 'research', 'blocker'] },
+          question: { type: 'string' },
+          why: { type: 'string' },
+        },
+        required: ['kind', 'question', 'why'],
+        additionalProperties: false,
+      },
+      output: textOutput,
+      execute({ kind, question, why }) {
+        question = question.trim()
+        why = why.trim()
+        if (!question || !why || question.length > 1200 || why.length > 1200 || requested >= 3) {
+          throw new Error('Submit up to three focused evidence questions with a reason for each.')
+        }
+        requested++
+        return JSON.stringify({ request_id: randomUUID(), kind, question, why })
+      },
+    })
+  }
+  if (evidence?.mode === 'results') {
+    ctx.tools.register({
+      name: evidenceResult,
+      description: 'Read the actual evidence returned by Codex for your requests in this conversation.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: textOutput,
+      execute() { return JSON.stringify(evidence.results) },
+    })
+  }
 
   if (bridge?.mode === 'request') {
     let requested = 0

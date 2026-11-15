@@ -60,6 +60,8 @@ python -B $runner --run-dir $record --goal "$record/goal.txt" --context "$record
 
 当 DSH 需要请 Codex 实测反例或补验收时，用[同会话测试桥](references/model-collaboration.md#同会话测试桥)。DSH 自己选用例并调用工具登记，Codex 核实并执行，将实测结果交回原对话让 DSH 独立复查。
 
+对需要查文件、公开调研或诊断卡点的讨论和审查，主动加 `--ask-codex`。DSH 先独立判断，只在补证可能改变结论时请求 Codex。收到退出码 4 时，按[同会话查证](references/model-collaboration.md#同会话查证)处理并继续原命令。把实际证据交回原会话，等 DSH 更新判断后，由 Codex 依据原验收标准决定。
+
 用户已经指定 DSH 里的共用工作区时，首轮加 `--dsh-workspace <该工作区的绝对路径>`。脚本用 DSH 的工作区登记接口把原会话加入指定组，日志仍写到独立的 `--run-dir`，后续沿用第一次的工作区和会话。桌面持有原会话写入权时，CLI 会停下。如果桌面刷新后仍显示旧分组，先确认 DSH 没有正在执行的任务，再正常退出桌面、用 CLI 续聊原会话，最后重开桌面核对侧栏。
 
 运行目录里的 `advice.md`（有标签时为 `advice-<标签>.md`）和 `review-1.md`、`review-2.md` 可以直接阅读。需要看 Codex 发了什么时，打开相应的 `*.prompt.txt`，桌面接续则看 `*.desktop-request.txt`。脚本另存 JSON 供程序使用。退出码 0 只说明本步骤满足脚本判据，2 表示结果需要检查或修订，也可能是参数错误，3 表示模型超时且已准备桌面请求。报告格式有误时，读保存的原文核实其中意见。没有合适的验收命令时省略 `--check`，由 Codex 用适合产物的手段核实。
