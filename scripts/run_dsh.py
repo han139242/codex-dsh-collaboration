@@ -636,7 +636,7 @@ def main():
             raise RuntimeError("That review already has a result. Use a new run directory.")
         if previous_workspace.exists():
             recorded = Path(previous_workspace.read_text(encoding="utf-8"))
-            if recorded != workspace:
+            if not recorded.is_absolute() or recorded.resolve() != workspace:
                 raise RuntimeError("Review workspace changed. Start a new run directory.")
         elif args.round == 2:
             raise RuntimeError("Missing round-1 workspace record. Start a new round 1.")

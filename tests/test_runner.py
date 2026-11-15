@@ -19,7 +19,7 @@ class RunnerTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         self.record = root / "record"
         self.goal = root / "goal.txt"
         self.goal.write_text("Goal: deduplicate. Acceptance: preserve first spelling.", encoding="utf-8")
@@ -131,7 +131,8 @@ class RunnerTest(unittest.TestCase):
 
     def test_round_two_accepts_legacy_report(self):
         self.record.mkdir()
-        (self.record / "review-workspace.txt").write_text(str(self.source.parent), encoding="utf-8")
+        recorded_workspace = self.record / ".."
+        (self.record / "review-workspace.txt").write_text(str(recorded_workspace), encoding="utf-8")
         (self.record / "review-1.json").write_text(json.dumps(
             {"verdict": "FAIL", "findings": ["旧报告里的问题"], "questions": []}
         ), encoding="utf-8")
