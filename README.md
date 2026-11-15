@@ -1,8 +1,10 @@
 # Codex + DSH 协作
 
-把同一个目标交给当前 Codex 对话。遇到方案取舍时，Codex 和 DeepSeek Harness（DSH）先各自思考，再比较依据。Codex 实施并核实 DSH 的意见，按需要修复和复查。
+[![Windows 测试](https://github.com/han139242/codex-dsh-collaboration/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/han139242/codex-dsh-collaboration/actions/workflows/tests.yml)
 
-**Codex 沿用你在当前对话选的模型。** DSH 固定使用国内 WorkBuddy 的 `DeepSeek-V4.1-Flash`。本项目是一个 Codex Skill 和本地 Python 脚本，通过 DSH headless 调用模型，无需 MCP 服务。
+**给一次目标，让 Codex 和 DeepSeek Harness（DSH）一起找盲点。** Codex 沿用当前对话选的模型。遇到重要取舍、排查卡点或关键验收时，请 DSH 独立提议或审查，再用项目证据和本机测试核实，由 Codex 最终决定。原因明确的小修由 Codex 直接处理。
+
+DSH 默认走国内 WorkBuddy 的 DeepSeek V4.1 Flash。回复不可用时可试国际版同款，再试 Hy4 Preview。优先使用命令行，必要时在桌面接续，统一保存中文原文和验收证据。
 
 ## 安装
 
@@ -20,7 +22,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not clone the skill' }
 python -B (Join-Path $destination 'scripts/run_dsh.py') --doctor
 ```
 
-如果 DSH 装在自定义位置，可在本次 PowerShell 会话设置 `DSH_DESKTOP_DIR` 指向包含 `DeepSeek Harness.exe` 的目录。`DSH_HOME` 默认是 `~/.dsh`。需要时可用 `DSH_WORKBUDDY_ENTRY` 指向已安装插件的 `lib/index.js`。这些覆盖也要在运行 Codex 的环境中可见。`--doctor` 只检查文件和启动器版本，无模型调用。
+用 Git 安装后，可在 Skill 目录运行 `git pull --ff-only` 更新，再运行 `--doctor` 检查本地启动器。桌面位置和插件路径可分别用 `DSH_DESKTOP_DIR` 和 `DSH_WORKBUDDY_ENTRY` 覆盖，`DSH_HOME` 默认为 `~/.dsh`。`--doctor` 只检查文件和启动器版本。
 
 ## 使用
 
@@ -28,15 +30,20 @@ python -B (Join-Path $destination 'scripts/run_dsh.py') --doctor
 
 > 用 Codex + DSH 协作，帮我实现……，验收标准是……
 
-也可用 `$codex-dsh-collaboration` 明确调用。辅助思考时，DSH 获得和 Codex 一致的任务目标、约束和验收标准。需要独立提案时先不发 Codex 的候选方案。审查转交当前文件快照，复查带上上一轮发现和 Codex 的处理依据。Codex 会核实意见，区分实际问题和待确认疑点。详见 [SKILL.md](SKILL.md)。
+也可用 `$codex-dsh-collaboration` 明确调用。两边按同一目标、限制和验收标准工作。各阶段的调用条件和命令见 [SKILL.md](SKILL.md)。
 
-用于实际项目时，先确定哪些材料可发给 WorkBuddy。模型调用消耗已有 WorkBuddy 积分。运行记录包括提交给模型的内容和结果，建议放在项目外。脚本通过临时配置锁定国内 WorkBuddy 的指定模型，关闭 DeepSeek 官方模型入口。
+| 想了解什么 | 从哪里看 |
+| --- | --- |
+| 全流程怎么跑 | [姓名去重示例](examples/README.md)提供一个有意保留缺陷的起点 |
+| 方案如何借鉴同类项目 | [项目对标](references/project-benchmark.md)说明如何查证和共享公开资料 |
+| 回复不可用或调用超时 | 查看[模型回退](references/workbuddy-routes.md)和[桌面接续](references/desktop-fallback.md) |
+| 双方交流和验证证据 | [协作小结](references/presentation.md)链接中文原文和实测输出，`*.status.md` 带等待时间与日志入口 |
 
-## 验证
+## 本地记录与验证
 
-在仓库根目录运行 `python -B -m unittest discover -s tests -v`，无需 WorkBuddy 账号。测试覆盖了讨论与审查使用同一任务说明、标准发生变化时拒绝沿用旧记录，以及审查后源文件变动时拒绝交付旧结论等行为。
+运行记录包含请求和结果，默认集中在 `~/Documents/Codex/dsh-collaboration/runs`。可以用 `DSH_COLLAB_DIR` 指定位置。将记录留在仓库外，只共享任务允许发送的材料。模型调用使用已有 WorkBuddy 积分，脚本关闭 DeepSeek 官方入口。
 
-如果你已配置 WorkBuddy，可用 [姓名去重示例](examples) 验证真实模型调用。
+在仓库根目录运行 `python -X utf8 -B -m unittest discover -s tests -v`。GitHub Actions 在 Windows 的 Python 3.10 和 3.13 上跑同一套测试，无需 DSH 或 WorkBuddy 账号。真实模型调用可用上面的姓名去重示例验证。
 
 ## 参考与许可
 

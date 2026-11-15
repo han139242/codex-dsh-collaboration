@@ -5,3 +5,27 @@ __pycache__/
 .env.*
 runs/
 *.log
+
+# Generated local collaboration records.
+*.prompt.txt
+*.status.md
+*.desktop.json
+*.desktop-request.txt
+*.desktop-import.json
+*.rejected.md
+shared-goal.txt
+shared-context.txt
+shared-benchmark.md
+review-workspace.txt
+review-*.brief.txt
+review-*.source.txt
+review-*.json
+review-*.md
+advice.json
+advice.md
+advice-*.json
+advice-*.md
+workbuddy.json
+workbuddy-*.json
+协作小结.md
+对标记录.md
