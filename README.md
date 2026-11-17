@@ -6,6 +6,16 @@
 
 仓库提供 DeepSeek Harness（DSH）的自动化脚本。其他模型可通过用户已有的 CLI、MCP、API 或对话工具参与。用户可指定模型，也可以委托 Codex 从可用入口挑选。优先用免费入口或已有额度，新增费用按用户同意的预算。豆包、Grok、DSH 或本地模型都可以作为选择，具体用法见[模型选择与中文交接](references/model-collaboration.md)。
 
+## 先选一种协作方式
+
+| 你想做什么 | 推荐入口 | 返回的证据 |
+| --- | --- | --- |
+| 有现成方案或改动，请另一模型找漏项 | 在 Codex 里调用 `$codex-dsh-collaboration`，说明目标和验收条件 | 独立提案或审查意见，以及 Codex 实际核对的结果 |
+| 让 DSH 自己观察项目并验证反例 | [独立取证模式](#让-dsh-在项目里独立取证) | 本轮工具记录、回复和进度页 |
+| 先讨论，再把实测交回去复查 | [同会话协作和双向测试](#同会话协作与双向测试) | 原会话保留查证请求与回传结果，可以回查它依据了什么 |
+
+第一次使用 DSH 时，可从合成的[姓名去重示例](examples/README.md)开始。固定版及变更见 [Releases](https://github.com/han139242/codex-dsh-collaboration/releases)。
+
 ## 安装
 
 使用其他模型时可只安装 Skill，并沿用自己的模型入口。下面的 DSH 配置用于自动化路线。历史实跑环境为 Windows 11、Python 3.13、DeepSeek Harness Desktop 0.2.2-rc.3 和 `dsh-connect-workbuddy` 5.23.1。兼容性随上游变化，安装后先运行 `--doctor`。脚本要求 Python 3.10 或更新版本。
