@@ -74,6 +74,8 @@ def bridge_turn(out, workspace, session_id, route, roots, mode, results, timeout
     elif results not in tool_results(events, RESULTS_TOOL):
         raise RuntimeError("未确认 DSH 已通过工具读回完整实测结果。")
     (out / f"{stage}.md").write_text(final[0].strip() + "\n", encoding="utf-8")
+    dsh.remember_cli_session(out, workspace, events, session_id,
+                             attach=(out / "dsh-workspace.txt").is_file())
     dsh.save_conversation(out, session_id, route)
     print(f"工具交换已完成：{out / (stage + '.md')}（原会话 {session_id}）", flush=True)
 

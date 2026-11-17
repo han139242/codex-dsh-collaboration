@@ -99,20 +99,22 @@ export async function apply(ctx, config) {
   const bridge = config.testBridge
   const evidence = config.evidenceBridge
   if (!roots.length && !bridge && !evidence) throw new Error('At least one scoped tool is required.')
-  const allowed = new Set()
-  if (roots.length) allowed.add(toolName)
-  if (bridge?.mode === 'request') allowed.add(testRequest)
-  if (bridge?.mode === 'results') allowed.add(testResult)
-  if (evidence?.mode === 'request') allowed.add(evidenceRequest)
-  if (evidence?.mode === 'results') allowed.add(evidenceResult)
-  ctx.tools.guard(exec => allowed.has(exec.name) ? undefined : 'Only the scoped tools approved for this turn may be used.')
+  if (config.restrictTools !== false) {
+    const allowed = new Set()
+    if (roots.length) allowed.add(toolName)
+    if (bridge?.mode === 'request') allowed.add(testRequest)
+    if (bridge?.mode === 'results') allowed.add(testResult)
+    if (evidence?.mode === 'request') allowed.add(evidenceRequest)
+    if (evidence?.mode === 'results') allowed.add(evidenceResult)
+    ctx.tools.guard(exec => allowed.has(exec.name) ? undefined : 'Only the scoped tools approved for this turn may be used.')
+  }
   const textOutput = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
 
   if (evidence?.mode === 'request') {
     let requested = 0
     ctx.tools.register({
       name: evidenceRequest,
-      description: 'Ask Codex to check one missing fact that could change your judgment. Use file for an authorized file, research for a public source, or blocker for a diagnostic check. This registers a question only.',
+      description: 'Ask Codex to check one missing fact that could change your judgment. Use file for an authorized file, research for a public source, or blocker for a diagnostic check. This registers a question only. If the answer blocks your decision, share what you verified so far and finish the current reply so Codex can return the evidence in this session.',
       parameters: {
         type: 'object',
         properties: {

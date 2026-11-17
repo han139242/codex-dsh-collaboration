@@ -28,6 +28,14 @@ class RunnerTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
+        dsh_home = root / "dsh-home"
+        dsh_home.mkdir()
+        home_patch = patch.object(run_dsh, "DSH_ROOT", dsh_home)
+        collaboration_patch = patch.object(run_dsh, "COLLAB_ROOT", root / "collaboration")
+        self.addCleanup(home_patch.stop)
+        self.addCleanup(collaboration_patch.stop)
+        home_patch.start()
+        collaboration_patch.start()
         self.record = root / "record"
         self.goal = root / "goal.txt"
         self.goal.write_text("Goal: deduplicate. Acceptance: preserve first spelling.", encoding="utf-8")
@@ -41,6 +49,16 @@ class RunnerTest(unittest.TestCase):
         argv = ["runner", "--goal", str(self.goal), "--run-dir", str(self.record), *args]
         with patch.object(sys, "argv", argv), patch.object(run_dsh, "check_plugin"), contextlib.redirect_stdout(io.StringIO()):
             return run_dsh.main()
+
+    def test_independent_web_fetch_works_without_optional_search_plugin(self):
+        self.record.mkdir()
+        missing = self.record / "optional-search.mjs"
+        with patch.object(run_dsh, "check_plugin"), patch.object(run_dsh, "PUBLIC_SEARCH", missing):
+            path = run_dsh.put_overlay(self.record, independent=True)
+        overlay = json.loads(path.read_text(encoding="utf-8"))
+        web_tool = next(row for row in overlay if row.get("id") == "tool-web")
+        self.assertFalse(web_tool["disabled"])
+        self.assertEqual(web_tool["config"], {"search": False, "fetch": True})
 
     def test_run_stage_delivers_exact_prompt_and_records_wait_then_exit(self):
         self.record.mkdir()

@@ -36,3 +36,11 @@ workbuddy.json
 workbuddy-*.json
 协作小结.md
 对标记录.md
+
+# Native-mode and progress artifacts.
+.dsh-independent
+.dsh-code-task
+*.overlay.json
+progress.html
+*.ready.json
+*.publish.json

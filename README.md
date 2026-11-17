@@ -8,7 +8,7 @@
 
 ## 安装
 
-使用其他模型时可只安装 Skill，并沿用自己的模型入口。下面的 DSH 配置用于自动化路线。已验证环境为 Windows 11、Python 3.13、DeepSeek Harness Desktop 0.2.2-rc.3 和 `dsh-connect-workbuddy` 5.23.1。脚本要求 Python 3.10 或更新版本。
+使用其他模型时可只安装 Skill，并沿用自己的模型入口。下面的 DSH 配置用于自动化路线。历史实跑环境为 Windows 11、Python 3.13、DeepSeek Harness Desktop 0.2.2-rc.3 和 `dsh-connect-workbuddy` 5.23.1。兼容性随上游变化，安装后先运行 `--doctor`。脚本要求 Python 3.10 或更新版本。
 
 在 PowerShell 运行下面的命令。已有安装时沿用原目录。目录说明见 [Codex Skills 文档](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)。
 
@@ -39,12 +39,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not clone the skill' }
 | 回复不可用或调用超时 | 命令行自动试国内 Flash、国际 Flash，再试 Hy4，详见[模型回退](references/workbuddy-routes.md)和[桌面接续](references/desktop-fallback.md) |
 | 双方交流和验证证据 | [协作小结](references/presentation.md)链接中文原文和实测输出，`*.status.md` 带等待时间与日志入口 |
 | 需要系统查漏时用什么 | 可选 [ISO/IEC 25010:2023 检查表](references/product-quality.md)。讨论方案、排查卡点时，围绕当前最需要回答的问题展开 |
-| 怎么让 DSH 自己查证 | [独立取证与分工](references/model-collaboration.md#独立取证与分工)说明如何授权只读工具，让 Codex 同时推进其他工作 |
+| 怎么让 DSH 自己查证 | [独立取证与分工](references/model-collaboration.md#原生独立取证)说明如何授权只读工具，让 Codex 同时推进其他工作 |
 | 怎么在一个 DSH 会话里来回交流 | [同会话协作与双向测试](#同会话协作与双向测试) |
 
 ## 同会话协作与双向测试
 
-在 DSH 桌面侧栏添加一次共用工作区，后续任务复用同一个工作区。对 Codex 说：
+原生独立取证在实际项目工作区内运行。限定材料路线可以复用事先登记的协作工作区。对 Codex 说：
 
 > 用 Codex + DSH 协作完成这个任务，放进 DSH 的「Codex + DSH 协作」工作区。同一个任务用同一条会话。让 DSH 自己挑需要实测的边界，你用本机工具验证，把实际结果回到原会话让它复查，最后你给结论。
 
@@ -126,6 +126,20 @@ python -B $runner @inquiryArgs --codex-results (Join-Path $record 'bridge-codex-
 
 如果 CLI 报会话已被占用，或桌面仍将会话显示在「未分组」，先确认 DSH 当前任务已结束，再正常退出桌面。沿用原 `--run-dir` 完成 CLI 步骤后重开 DSH，在指定工作区查看原会话。运行目录里的 `dsh-conversation.json` 记录了会话 ID，可用于核对。
 
+## 让 DSH 在项目里独立取证
+
+显式指定获准的项目目录。原生模式默认采用只读预设，可使用本机文件、终端和网页工具；只允许读取几份文件时，改用 [限定材料取证](references/model-collaboration.md#限定材料取证)。原生模式沿用已连接的 WorkBuddy 入口。公共搜索插件可选，用 `DSH_PUBLIC_SEARCH_ENTRY` 指向本机已安装的入口。运行记录包含交接材料，存放在项目以外的私有目录。
+
+```powershell
+$runner = (Resolve-Path './scripts/run_dsh.py').Path
+$goal = (Resolve-Path './examples/goal.txt').Path
+$workspace = (Resolve-Path './examples').Path
+$record = Join-Path ([IO.Path]::GetTempPath()) ('dsh-example-' + [guid]::NewGuid())
+python -B $runner --run-dir $record --goal $goal --workspace $workspace --independent --ask-codex --advice '自己选择并验证最小反例'
+```
+
+续轮沿用原 `--run-dir`。如果退出码为 4，按[同会话查证](references/model-collaboration.md#同会话查证)核对请求并回传证据。
+
 ## 与项目调研与产品对标配合使用
 
 本 Skill 可独立用于讨论方案、排查卡点、审查和复查。需要先广找同类项目、核实哪些做法值得借鉴时，可以配合 [项目调研与产品对标](https://github.com/han139242/benchmark-product-workflows#安装)。只想做调研时，直接用对标 Skill 即可。
@@ -141,6 +155,8 @@ python -B $runner @inquiryArgs --codex-results (Join-Path $record 'bridge-codex-
 在仓库根目录运行 `python -X utf8 -B -m unittest discover -s tests -v`。GitHub Actions 在 Windows 的 Python 3.10 和 3.13 上跑同一套测试，无需 DSH 或 WorkBuddy 账号。真实模型调用可用上面的姓名去重示例验证。
 
 反馈问题时，请附所用入口、阶段、最小复现、期望结果和实际结果。用合成示例或脱敏摘要说明问题。新增入口的文档请写清它依赖的授权工具、费用和用户可验证的行为。
+
+维护步骤见 [MAINTAINERS.md](MAINTAINERS.md)。
 
 ## 参考与许可
 
